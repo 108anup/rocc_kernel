@@ -144,8 +144,15 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		}
 	}
 
-	// Set cwnd
-	cwnd = pkts_acked + rocc_alpha;
+	// Set cwnd based on ccmatic rule
+	loss_mode = (u64) pkts_lost * 1024 > (u64) (pkts_acked + pkts_lost) * rocc_loss_thresh;
+	if(loss_mode) {
+		cwnd = (tsk->snd_cwnd)/2 + rocc_alpha;
+	}
+	else {
+		cwnd = (tsk->snd_cwnd + pkts_acked)/2 + rocc_alpha;
+	}
+
 	if (app_limited && cwnd < tsk->snd_cwnd) {
 		// Do not decrease cwnd if app limited
 		cwnd = tsk->snd_cwnd;
@@ -155,22 +162,22 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	}
 	tsk->snd_cwnd = cwnd;
 
-	// Set pacing according to cwnd and whether there was excessive
-	// loss. Note, this stuff isn't CCAC approved (yet).
-	loss_mode = (u64) pkts_lost * 1024 > (u64) (pkts_acked + pkts_lost) * rocc_loss_thresh;
-	if (loss_mode) {
-		// If the loss rate was too high, reduce the pacing rate. Do
-		// division at the end to minimize error due to
-		// integers. Further, do all computations in u64.
-		sk->sk_pacing_rate = 1000000 * (u64) cwnd * rocc_get_mss(tsk) * (1024 + 2 * rocc_loss_thresh) / (rtt_us * 2 * 1024);
-	}
-	else {
-		// No loss, send normal pacing rate. We use min_rtt just to be
-		// pace a little extra because we want to be cwnd
-		// limited. Doing that in loss_mode can be dangerous if min_rtt
-		// is an underestimate
-		sk->sk_pacing_rate = 1000000 * (u64) cwnd * rocc_get_mss(tsk) / rocc->min_rtt_us;
-	}
+	// // Set pacing according to cwnd and whether there was excessive
+	// // loss. Note, this stuff isn't CCAC approved (yet).
+	// if (loss_mode) {
+	// 	// If the loss rate was too high, reduce the pacing rate. Do
+	// 	// division at the end to minimize error due to
+	// 	// integers. Further, do all computations in u64.
+	// 	sk->sk_pacing_rate = 1000000 * (u64) cwnd * rocc_get_mss(tsk) * (1024 + 2 * rocc_loss_thresh) / (rtt_us * 2 * 1024);
+	// }
+	// else {
+	// 	// No loss, send normal pacing rate. We use min_rtt just to be
+	// 	// pace a little extra because we want to be cwnd
+	// 	// limited. Doing that in loss_mode can be dangerous if min_rtt
+	// 	// is an underestimate
+	// 	sk->sk_pacing_rate = 1000000 * (u64) cwnd * rocc_get_mss(tsk) / rocc->min_rtt_us;
+	// }
+	sk->sk_pacing_rate = 1000000 * (u64) cwnd * rocc_get_mss(tsk) / rocc->min_rtt_us;
 
 #ifdef ROCC_DEBUG
 	printk(KERN_INFO "rocc flow %u cwnd %u pacing %lu rtt %u mss %u timestamp %llu interval %ld", rocc->id, tsk->snd_cwnd, sk->sk_pacing_rate, rtt_us, tsk->mss_cache, timestamp, rs->interval_us);
@@ -207,7 +214,7 @@ static void rocc_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 
 static struct tcp_congestion_ops tcp_rocc_cong_ops __read_mostly = {
 	.flags = TCP_CONG_NON_RESTRICTED,
-	.name = "rocc",
+	.name = "rocc_ccmatic",
 	.owner = THIS_MODULE,
 	.init = rocc_init,
 	.release	= rocc_release,
@@ -240,4 +247,4 @@ module_exit(rocc_unregister);
 
 MODULE_AUTHOR("Venkat Arun <venkatarun95@gmail.com>");
 MODULE_LICENSE("Dual BSD/GPL");
-MODULE_DESCRIPTION("TCP RoCC (Robust Congestion Control)");
+MODULE_DESCRIPTION("TCP RoCC CCmatic (Robust Congestion Control CCmatic)");
