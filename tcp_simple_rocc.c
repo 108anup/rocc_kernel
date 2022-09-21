@@ -144,14 +144,8 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		}
 	}
 
-	// Set cwnd based on ccmatic rule
-	loss_mode = (u64) pkts_lost * 1024 > (u64) (pkts_acked + pkts_lost) * rocc_loss_thresh;
-	if(loss_mode) {
-		cwnd = (tsk->snd_cwnd)/2 + rocc_alpha;
-	}
-	else {
-		cwnd = (tsk->snd_cwnd + pkts_acked)/2 + rocc_alpha;
-	}
+	// Set cwnd
+	cwnd = pkts_acked + rocc_alpha;
 
 	if (app_limited && cwnd < tsk->snd_cwnd) {
 		// Do not decrease cwnd if app limited
@@ -214,7 +208,7 @@ static void rocc_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 
 static struct tcp_congestion_ops tcp_rocc_cong_ops __read_mostly = {
 	.flags = TCP_CONG_NON_RESTRICTED,
-	.name = "rocc_ccmatic",
+	.name = "simple_rocc",
 	.owner = THIS_MODULE,
 	.init = rocc_init,
 	.release	= rocc_release,
@@ -247,4 +241,4 @@ module_exit(rocc_unregister);
 
 MODULE_AUTHOR("Venkat Arun <venkatarun95@gmail.com>");
 MODULE_LICENSE("Dual BSD/GPL");
-MODULE_DESCRIPTION("TCP RoCC CCmatic (Robust Congestion Control CCmatic)");
+MODULE_DESCRIPTION("TCP Simple RoCC (Robust Congestion Control)");
