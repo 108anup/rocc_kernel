@@ -107,7 +107,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	if (rocc->min_rtt_us == U32_MAX)
 		hist_us = U32_MAX;
 	else
-		hist_us = 2 * rocc->min_rtt_us;
+		hist_us = 3 * rocc->min_rtt_us;
 
 	// Update intervals
 	timestamp = tsk->tcp_mstamp; // Most recent send/receive
@@ -147,10 +147,10 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	// Set cwnd based on ccmatic rule
 	loss_mode = (u64) pkts_lost * 1024 > (u64) (pkts_acked + pkts_lost) * rocc_loss_thresh;
 	if(loss_mode) {
-		cwnd = (tsk->snd_cwnd)/2 + rocc_alpha;
+		cwnd = (tsk->snd_cwnd)/2;
 	}
 	else {
-		cwnd = (tsk->snd_cwnd + pkts_acked)/2 + rocc_alpha;
+		cwnd = (tsk->snd_cwnd + pkts_acked)/2;
 	}
 
 	if (app_limited && cwnd < tsk->snd_cwnd) {
@@ -195,12 +195,13 @@ static void rocc_release(struct sock *sk)
 	kfree(rocc->intervals);
 }
 
-/* ROCC does not need to undo the cwnd since it does not
- * always reduce cwnd on losses. Keep it for now.
+/* Since RoCC ccmatic does reduce cwnd on loss. We use reno's undo method.
  */
 static u32 rocc_undo_cwnd(struct sock *sk)
 {
-	return tcp_sk(sk)->snd_cwnd;
+	const struct tcp_sock *tp = tcp_sk(sk);
+
+	return max(tcp_snd_cwnd(tp), tp->prior_cwnd);
 }
 
 static u32 rocc_ssthresh(struct sock *sk)
