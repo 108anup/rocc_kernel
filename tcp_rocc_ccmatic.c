@@ -195,15 +195,6 @@ static void rocc_release(struct sock *sk)
 	kfree(rocc->intervals);
 }
 
-/* Since RoCC ccmatic does reduce cwnd on loss. We use reno's undo method.
- */
-static u32 rocc_undo_cwnd(struct sock *sk)
-{
-	const struct tcp_sock *tp = tcp_sk(sk);
-
-	return max(tcp_snd_cwnd(tp), tp->prior_cwnd);
-}
-
 static u32 rocc_ssthresh(struct sock *sk)
 {
 	return TCP_INFINITE_SSTHRESH; /* ROCC does not use ssthresh */
@@ -221,7 +212,9 @@ static struct tcp_congestion_ops tcp_rocc_cong_ops __read_mostly = {
 	.release	= rocc_release,
 	.cong_control = rocc_process_sample,
 	/* Keep the windows static */
-	.undo_cwnd = rocc_undo_cwnd,
+	/* Since RoCC ccmatic does reduce cwnd on loss. We use reno's undo method.
+	 */
+	.undo_cwnd = tcp_reno_undo_cwnd,
 	/* Slow start threshold will not exist */
 	 .ssthresh = rocc_ssthresh,
 	.cong_avoid = rocc_cong_avoid,
