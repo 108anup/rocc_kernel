@@ -36,6 +36,8 @@ struct rocc_data {
 
 	// debug helper
 	u32 id;
+
+	u32 last_decrease_seq;
 };
 
 static void rocc_init(struct sock *sk)
@@ -56,6 +58,9 @@ static void rocc_init(struct sock *sk)
 	rocc->min_rtt_us = U32_MAX;
 	++id;
 	rocc->id = id;
+	// At connection setup, assume just decreased.
+	// We don't expect loss during initial part of slow start anyway.
+	rocc->last_decrease_seq = tcp_sk(sk)->snd_nxt;
 
 	cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
 }
@@ -146,8 +151,11 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 
 	// Set cwnd based on ccmatic rule
 	loss_mode = (u64) pkts_lost * 1024 > (u64) (pkts_acked + pkts_lost) * rocc_loss_thresh;
-	if(loss_mode) {
+	// TODO: rs->last_end_seq requires some high kernel version...
+	bool is_new_congestion_event = after(rs->last_end_seq, rocc->last_decrease_seq);
+	if(loss_mode && is_new_congestion_event) {
 		cwnd = (tsk->snd_cwnd)/2;
+		rocc->last_decrease_seq = tsk->snd_nxt;
 	}
 	else {
 		cwnd = (tsk->snd_cwnd + pkts_acked)/2;
