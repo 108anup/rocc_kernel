@@ -90,6 +90,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	u32 pkts_acked, pkts_lost;
 	u32 cwnd;
 	bool loss_mode, app_limited;
+	bool is_new_congestion_event;
 
 	if (!rocc_valid(rocc))
 		return;
@@ -152,7 +153,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	// Set cwnd based on ccmatic rule
 	loss_mode = (u64) pkts_lost * 1024 > (u64) (pkts_acked + pkts_lost) * rocc_loss_thresh;
 	// TODO: rs->last_end_seq requires some high kernel version...
-	bool is_new_congestion_event = after(rs->last_end_seq, rocc->last_decrease_seq);
+	is_new_congestion_event = after(rs->last_end_seq, rocc->last_decrease_seq);
 	if(loss_mode && is_new_congestion_event) {
 		cwnd = (tsk->snd_cwnd)/2;
 		rocc->last_decrease_seq = tsk->snd_nxt;
