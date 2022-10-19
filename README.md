@@ -1,5 +1,7 @@
 # RoCC (Robust Congestion Control)
 
+Only works with Linux kernel >= 5.15
+
 Linux kernel module for RoCC
 
 Run `make` and then `sudo insmod tcp_rocc_ccmatic.ko` to install the module.
