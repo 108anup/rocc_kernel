@@ -1,7 +1,7 @@
 ifneq ($(KERNELRELEASE),)
 
 # kbuild part of makefile
-obj-m  := tcp_rocc_ccmatic.o
+obj-m  := tcp_aitd_combad.o
 
 else
 # normal makefile

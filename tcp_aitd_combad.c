@@ -88,6 +88,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	u32 interval_length;
 	// Number of packets acked and lost in the last `hist_us`
 	u32 pkts_acked, pkts_lost;
+	u32 target_cwnd;
 	u32 cwnd;
 	bool loss_mode, app_limited;
 	bool is_new_congestion_event;
@@ -151,15 +152,26 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	}
 
 	// Set cwnd based on ccmatic rule
-	loss_mode = (u64) pkts_lost * 1024 > (u64) (pkts_acked + pkts_lost) * rocc_loss_thresh;
+	// TODO: verify if cwnds are in units of MSS (or packet size).
 	// TODO: rs->last_end_seq requires some high kernel version...
+
+	// combad on loss
+	loss_mode = (u64) pkts_lost * 1024 > (u64) (pkts_acked + pkts_lost) * rocc_loss_thresh;
 	is_new_congestion_event = after(rs->last_end_seq, rocc->last_decrease_seq);
-	if(loss_mode && is_new_congestion_event) {
-		cwnd = (tsk->snd_cwnd)/2;
+	if (loss_mode && is_new_congestion_event) {
+		target_cwnd = (tsk->snd_cwnd) - 1;
 		rocc->last_decrease_seq = tsk->snd_nxt;
 	}
 	else {
-		cwnd = (tsk->snd_cwnd + pkts_acked)/2;
+		target_cwnd = (tsk->snd_cwnd + pkts_acked)/2 + 1;
+	}
+
+	// aitd on link rate variations
+	if (cwnd > target_cwnd) {
+		cwnd = target_cwnd;
+	}
+	else {
+		cwnd = target_cwnd + 1;
 	}
 
 	if (app_limited && cwnd < tsk->snd_cwnd) {
@@ -215,7 +227,7 @@ static void rocc_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 
 static struct tcp_congestion_ops tcp_rocc_cong_ops __read_mostly = {
 	.flags = TCP_CONG_NON_RESTRICTED,
-	.name = "rocc_ccmatic",
+	.name = "aitd_combad",
 	.owner = THIS_MODULE,
 	.init = rocc_init,
 	.release	= rocc_release,
