@@ -114,7 +114,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	if (rocc->min_rtt_us == U32_MAX)
 		hist_us = U32_MAX;
 	else
-		hist_us = 3 * rocc->min_rtt_us;
+		hist_us = 2 * rocc->min_rtt_us;
 
 	// Update intervals
 	timestamp = tsk->tcp_mstamp; // Most recent send/receive
