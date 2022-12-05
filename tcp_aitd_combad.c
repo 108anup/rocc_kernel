@@ -3,7 +3,7 @@
 
 #include <net/tcp.h>
 
-#undef ROCC_DEBUG
+#define ROCC_DEBUG
 
 // Should be a power of two so rocc_num_intervals_mask can be set
 static const u16 rocc_num_intervals = 16;
@@ -14,7 +14,6 @@ static const u32 rocc_min_cwnd = 2;
 // Maximum tolerable loss rate, expressed as `loss_thresh / 1024`. Calculations
 // are faster if things are powers of 2
 static const u64 rocc_loss_thresh = 64;
-static const u32 rocc_alpha = 2;
 
 // To keep track of the number of packets acked over a short period of time
 struct rocc_interval {
@@ -151,62 +150,61 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		}
 	}
 
-	// Set cwnd based on ccmatic rule
-	// TODO: verify if cwnds are in units of MSS (or packet size).
-	// TODO: rs->last_end_seq requires some high kernel version...
+	// CCMATIC RULE
+	/**
+	 * if(Ld_f[n][t] > Ld_f[n][t-1]):
+	 *     expr = 1c_f[n][t-1] + 0(S_f[n][t-1]-S_f[n][t-3]) + -1alpha
+	 * else:
+	 *     expr = 1/2c_f[n][t-1] + 1/2(S_f[n][t-1]-S_f[n][t-3]) + 1alpha
+	 *
+	 * if(1c_f[n][t-1] + 0(S_f[n][t-1]-S_f[n][t-3]) + -1expr + 0Indicator(Ld_f[n][t] > Ld_f[n][t-1]) > 0):
+	 *     c_f[n][t] = max(alpha, 0c_f[n][t-1] + 1expr + 0(S_f[n][t-1]-S_f[n][t-3]) + 0alpha)
+	 * else:
+	 *     c_f[n][t] = max(alpha, 1c_f[n][t-1] + 0expr + 0(S_f[n][t-1]-S_f[n][t-3]) + 1alpha)
+	*/
 
-	// combad on loss
+	// TARGET CWND
 	loss_mode = (u64) pkts_lost * 1024 > (u64) (pkts_acked + pkts_lost) * rocc_loss_thresh;
 	is_new_congestion_event = after(rs->last_end_seq, rocc->last_decrease_seq);
 	if (loss_mode && is_new_congestion_event) {
-		target_cwnd = (tsk->snd_cwnd) - 1;
 		rocc->last_decrease_seq = tsk->snd_nxt;
+		target_cwnd = (tsk->snd_cwnd) - 1;
+		// ^ additive decrement as it is once per loss event, independent of number of ACKs/packets
 	}
 	else {
+		// TODO: check if rate decrease needs conversion from per RTT response to per ACK response.
 		target_cwnd = (tsk->snd_cwnd + pkts_acked)/2 + 1;
 	}
 
-	// aitd on link rate variations
-	if (cwnd > target_cwnd) {
+	// UPDATE CWND
+	if (tsk->snd_cwnd > target_cwnd) {
+		// cwnd decrease
+		// AD on loss OR MD on rate decrease
 		cwnd = target_cwnd;
+		// Do not decrease cwnd if app limited
+		if (app_limited && cwnd < tsk->snd_cwnd) {
+			cwnd = tsk->snd_cwnd;
+		}
+		// Lower bound clamp
+		cwnd = max(cwnd, rocc_min_cwnd);
+		tsk->snd_cwnd = cwnd;
 	}
 	else {
-		cwnd = target_cwnd + 1;
+		// cwnd increase
+		// Additive increments
+		tcp_cong_avoid_ai(tsk, cwnd, rs->acked_sacked);
+		// Above function direclty updates tsk->snd_cwnd
 	}
 
-	if (app_limited && cwnd < tsk->snd_cwnd) {
-		// Do not decrease cwnd if app limited
-		cwnd = tsk->snd_cwnd;
-	}
-	if (cwnd < rocc_min_cwnd) {
-		cwnd = rocc_min_cwnd;
-	}
-	tsk->snd_cwnd = cwnd;
-
-	// // Set pacing according to cwnd and whether there was excessive
-	// // loss. Note, this stuff isn't CCAC approved (yet).
-	// if (loss_mode) {
-	// 	// If the loss rate was too high, reduce the pacing rate. Do
-	// 	// division at the end to minimize error due to
-	// 	// integers. Further, do all computations in u64.
-	// 	sk->sk_pacing_rate = 1000000 * (u64) cwnd * rocc_get_mss(tsk) * (1024 + 2 * rocc_loss_thresh) / (rtt_us * 2 * 1024);
-	// }
-	// else {
-	// 	// No loss, send normal pacing rate. We use min_rtt just to be
-	// 	// pace a little extra because we want to be cwnd
-	// 	// limited. Doing that in loss_mode can be dangerous if min_rtt
-	// 	// is an underestimate
-	// 	sk->sk_pacing_rate = 1000000 * (u64) cwnd * rocc_get_mss(tsk) / rocc->min_rtt_us;
-	// }
 	sk->sk_pacing_rate = 1000000 * (u64) cwnd * rocc_get_mss(tsk) / rocc->min_rtt_us;
 
 #ifdef ROCC_DEBUG
 	printk(KERN_INFO "rocc flow %u cwnd %u pacing %lu rtt %u mss %u timestamp %llu interval %ld", rocc->id, tsk->snd_cwnd, sk->sk_pacing_rate, rtt_us, tsk->mss_cache, timestamp, rs->interval_us);
 	printk(KERN_INFO "rocc pkts_acked %u hist_us %u pacing %lu loss_mode %d app_limited %d rs_limited %d", pkts_acked, hist_us, sk->sk_pacing_rate, (int)loss_mode, (int)app_limited, (int)rs->is_app_limited);
-	for (i = 0; i < rocc_num_intervals; ++i) {
-		id = (rocc->intervals_head + i) & rocc_num_intervals_mask;
-		printk(KERN_INFO "rocc intervals %llu acked %u lost %u app_limited %d i %u id %u", rocc->intervals[id].start_us, rocc->intervals[id].pkts_acked, rocc->intervals[id].pkts_lost, (int)rocc->intervals[id].app_limited, i, id);
-	}
+	// for (i = 0; i < rocc_num_intervals; ++i) {
+	// 	id = (rocc->intervals_head + i) & rocc_num_intervals_mask;
+	// 	printk(KERN_INFO "rocc intervals %llu acked %u lost %u app_limited %d i %u id %u", rocc->intervals[id].start_us, rocc->intervals[id].pkts_acked, rocc->intervals[id].pkts_lost, (int)rocc->intervals[id].app_limited, i, id);
+	// }
 #endif
 }
 
