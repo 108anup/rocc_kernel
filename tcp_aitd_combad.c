@@ -192,7 +192,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	else {
 		// cwnd increase
 		// Additive increments
-		tcp_cong_avoid_ai(tsk, cwnd, rs->acked_sacked);
+		tcp_cong_avoid_ai(tsk, tsk->snd_cwnd, rs->acked_sacked);
 		// Above function direclty updates tsk->snd_cwnd
 	}
 
