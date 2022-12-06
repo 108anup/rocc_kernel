@@ -164,7 +164,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	is_new_congestion_event = after(rs->last_end_seq, rocc->last_decrease_seq);
 	if(loss_mode && is_new_congestion_event) {
 		rocc->last_decrease_seq = tsk->snd_nxt;
-		cwnd = (tsk->snd_cwnd)/2;
+		cwnd = (tsk->snd_cwnd)/2 -1*rocc_alpha;
 		// ^ multiplicative decrement triggered on unique loss event.
 	}
 	else {
