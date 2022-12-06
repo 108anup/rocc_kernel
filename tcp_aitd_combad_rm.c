@@ -37,6 +37,9 @@ struct rocc_data {
 	u32 id;
 
 	u32 last_decrease_seq;
+	bool loss_happened;
+
+	u64 last_update_tstamp;
 };
 
 static void rocc_init(struct sock *sk)
@@ -60,6 +63,12 @@ static void rocc_init(struct sock *sk)
 	// At connection setup, assume just decreased.
 	// We don't expect loss during initial part of slow start anyway.
 	rocc->last_decrease_seq = tcp_sk(sk)->snd_nxt;
+
+	// We want update to happen if it hasn't happened since Rm time.
+	// Setting last time as 0 in the beginning should allow running cwnd update
+	// the first time as long as min_rtt_us < timestamp.
+	rocc->last_update_tstamp = 0; // tcp_sk(sk)->tcp_mstamp;
+	rocc->loss_happened = false;
 
 	cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
 }
@@ -150,62 +159,67 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		}
 	}
 
-	// CCMATIC RULE
-	/**
-	 * if(Ld_f[n][t] > Ld_f[n][t-1]):
-	 *     expr = 1c_f[n][t-1] + 0(S_f[n][t-1]-S_f[n][t-3]) + -1alpha
-	 * else:
-	 *     expr = 1/2c_f[n][t-1] + 1/2(S_f[n][t-1]-S_f[n][t-3]) + 1alpha
-	 *
-	 * if(1c_f[n][t-1] + 0(S_f[n][t-1]-S_f[n][t-3]) + -1expr + 0Indicator(Ld_f[n][t] > Ld_f[n][t-1]) > 0):
-	 *     c_f[n][t] = max(alpha, 0c_f[n][t-1] + 1expr + 0(S_f[n][t-1]-S_f[n][t-3]) + 0alpha)
-	 * else:
-	 *     c_f[n][t] = max(alpha, 1c_f[n][t-1] + 0expr + 0(S_f[n][t-1]-S_f[n][t-3]) + 1alpha)
-	*/
-
-	// TARGET CWND
 	loss_mode = (u64) pkts_lost * 1024 > (u64) (pkts_acked + pkts_lost) * rocc_loss_thresh;
 	is_new_congestion_event = after(rs->last_end_seq, rocc->last_decrease_seq);
-	if (loss_mode && is_new_congestion_event) {
-		rocc->last_decrease_seq = tsk->snd_nxt;
-		target_cwnd = (tsk->snd_cwnd) - 1;
-		// ^ additive decrement as it is once per loss event, independent of number of ACKs/packets
-	}
-	else {
-		// TODO: check if rate decrease needs conversion from per RTT response to per ACK response.
-		target_cwnd = (tsk->snd_cwnd + pkts_acked)/2 + 1;
+	if(loss_mode && is_new_congestion_event) {
+		rocc->loss_happened = true;
 	}
 
-	// UPDATE CWND
-	if (tsk->snd_cwnd > target_cwnd) {
-		// cwnd decrease
-		// AD on loss OR MD on rate decrease
-		cwnd = target_cwnd;
-		// Do not decrease cwnd if app limited
-		if (app_limited && cwnd < tsk->snd_cwnd) {
-			cwnd = tsk->snd_cwnd;
+	if (timestamp - rocc->last_update_tstamp >= rocc->min_rtt_us) {
+		// Propagation delay (Rm) worth of time has elapsed since last cwnd update,
+		// time to make a new update to cwnd.
+
+		// CCMATIC RULE
+		/**
+		 * if(Ld_f[n][t] > Ld_f[n][t-1]):
+		 *     expr = 1c_f[n][t-1] + 0(S_f[n][t-1]-S_f[n][t-3]) + -1alpha
+		 * else:
+		 *     expr = 1/2c_f[n][t-1] + 1/2(S_f[n][t-1]-S_f[n][t-3]) + 1alpha
+		 *
+		 * if(1c_f[n][t-1] + 0(S_f[n][t-1]-S_f[n][t-3]) + -1expr + 0Indicator(Ld_f[n][t] > Ld_f[n][t-1]) > 0):
+		 *     c_f[n][t] = max(alpha, 0c_f[n][t-1] + 1expr + 0(S_f[n][t-1]-S_f[n][t-3]) + 0alpha)
+		 * else:
+		 *     c_f[n][t] = max(alpha, 1c_f[n][t-1] + 0expr + 0(S_f[n][t-1]-S_f[n][t-3]) + 1alpha)
+		*/
+
+		// TARGET CWND
+		if(rocc->loss_happened) {
+			rocc->last_decrease_seq = tsk->snd_nxt;
+			target_cwnd = (tsk->snd_cwnd) - 1;
 		}
-		// Lower bound clamp
-		cwnd = max(cwnd, rocc_min_cwnd);
-		tsk->snd_cwnd = cwnd;
-	}
-	else {
-		// cwnd increase
-		// Additive increments
-		tcp_cong_avoid_ai(tsk, tsk->snd_cwnd, rs->acked_sacked);
-		// Above function direclty updates tsk->snd_cwnd
-	}
+		else {
+			target_cwnd = (tsk->snd_cwnd + pkts_acked)/2 + 1;
+		}
 
-	sk->sk_pacing_rate = 1000000 * (u64) cwnd * rocc_get_mss(tsk) / rocc->min_rtt_us;
+		// UPDATE CWND
+		if (tsk->snd_cwnd > target_cwnd) {
+			cwnd = target_cwnd;
+			// Do not decrease cwnd if app limited
+			if (app_limited && cwnd < tsk->snd_cwnd) {
+				cwnd = tsk->snd_cwnd;
+			}
+			// Lower bound clamp
+			cwnd = max(cwnd, rocc_min_cwnd);
+			tsk->snd_cwnd = cwnd;
+		}
+		else {
+			tsk->snd_cwnd = tsk->snd_cwnd + 1;
+		}
+
+		sk->sk_pacing_rate = 1000000 * (u64) cwnd * rocc_get_mss(tsk) / rocc->min_rtt_us;
 
 #ifdef ROCC_DEBUG
-	printk(KERN_INFO "rocc flow %u cwnd %u pacing %lu rtt %u mss %u timestamp %llu interval %ld", rocc->id, tsk->snd_cwnd, sk->sk_pacing_rate, rtt_us, tsk->mss_cache, timestamp, rs->interval_us);
-	printk(KERN_INFO "rocc pkts_acked %u hist_us %u pacing %lu loss_mode %d app_limited %d rs_limited %d", pkts_acked, hist_us, sk->sk_pacing_rate, (int)loss_mode, (int)app_limited, (int)rs->is_app_limited);
-	// for (i = 0; i < rocc_num_intervals; ++i) {
-	// 	id = (rocc->intervals_head + i) & rocc_num_intervals_mask;
-	// 	printk(KERN_INFO "rocc intervals %llu acked %u lost %u app_limited %d i %u id %u", rocc->intervals[id].start_us, rocc->intervals[id].pkts_acked, rocc->intervals[id].pkts_lost, (int)rocc->intervals[id].app_limited, i, id);
-	// }
+		printk(KERN_INFO "rocc flow %u cwnd %u pacing %lu rtt %u mss %u timestamp %llu interval %ld", rocc->id, tsk->snd_cwnd, sk->sk_pacing_rate, rtt_us, tsk->mss_cache, timestamp, rs->interval_us);
+		printk(KERN_INFO "rocc pkts_acked %u hist_us %u pacing %lu loss_happened %d app_limited %d rs_limited %d", pkts_acked, hist_us, sk->sk_pacing_rate, (int)rocc->loss_happened, (int)app_limited, (int)rs->is_app_limited);
+		// for (i = 0; i < rocc_num_intervals; ++i) {
+		// 	id = (rocc->intervals_head + i) & rocc_num_intervals_mask;
+		// 	printk(KERN_INFO "rocc intervals %llu acked %u lost %u app_limited %d i %u id %u", rocc->intervals[id].start_us, rocc->intervals[id].pkts_acked, rocc->intervals[id].pkts_lost, (int)rocc->intervals[id].app_limited, i, id);
+		// }
 #endif
+		// Set state for next cwnd update
+		rocc->last_update_tstamp = timestamp;
+		rocc->loss_happened = false;
+	}
 }
 
 static void rocc_release(struct sock *sk)
