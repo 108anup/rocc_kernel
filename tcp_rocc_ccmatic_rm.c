@@ -198,7 +198,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 
 #ifdef ROCC_DEBUG
 		printk(KERN_INFO "rocc flow %u cwnd %u pacing %lu rtt %u mss %u timestamp %llu interval %ld", rocc->id, tsk->snd_cwnd, sk->sk_pacing_rate, rtt_us, tsk->mss_cache, timestamp, rs->interval_us);
-		printk(KERN_INFO "rocc pkts_acked %u hist_us %u pacing %lu loss_mode %d app_limited %d rs_limited %d", pkts_acked, hist_us, sk->sk_pacing_rate, (int)loss_mode, (int)app_limited, (int)rs->is_app_limited);
+		printk(KERN_INFO "rocc pkts_acked %u hist_us %u pacing %lu loss_happened %d app_limited %d rs_limited %d", pkts_acked, hist_us, sk->sk_pacing_rate, (int)rocc->loss_happened, (int)app_limited, (int)rs->is_app_limited);
 		// for (i = 0; i < rocc_num_intervals; ++i) {
 		// 	id = (rocc->intervals_head + i) & rocc_num_intervals_mask;
 		// 	printk(KERN_INFO "rocc intervals %llu acked %u lost %u app_limited %d i %u id %u", rocc->intervals[id].start_us, rocc->intervals[id].pkts_acked, rocc->intervals[id].pkts_lost, (int)rocc->intervals[id].app_limited, i, id);
