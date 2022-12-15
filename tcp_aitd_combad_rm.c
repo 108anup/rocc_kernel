@@ -183,12 +183,10 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		*/
 
 		// TARGET CWND
+		target_cwnd = (tsk->snd_cwnd + pkts_acked)/2 + 1;
 		if(rocc->loss_happened) {
 			rocc->last_decrease_seq = tsk->snd_nxt;
-			target_cwnd = (tsk->snd_cwnd) - 1;
-		}
-		else {
-			target_cwnd = (tsk->snd_cwnd + pkts_acked)/2 + 1;
+			target_cwnd = min(target_cwnd, (tsk->snd_cwnd) - 1);
 		}
 
 		// UPDATE CWND
