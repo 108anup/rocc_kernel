@@ -15,6 +15,8 @@ static const u32 rocc_alpha = 1;
 // Maximum tolerable loss rate, expressed as `loss_thresh / 1024`. Calculations
 // are faster if things are powers of 2
 static const u64 rocc_loss_thresh = 64;
+static const u32 rocc_periods_between_large_loss = 8;
+static const u32 rocc_history_periods = 2;
 
 // To keep track of the number of packets acked over a short period of time
 struct rocc_interval {
@@ -75,6 +77,10 @@ static void rocc_init(struct sock *sk)
 	rocc->last_update_tstamp = 0; // tcp_sk(sk)->tcp_mstamp;
 	rocc->loss_happened = false;
 
+	rocc->last_loss_tstamp = 0; // tcp_sk(sk)->tcp_mstamp;
+	rocc->last_cwnd = rocc_min_cwnd;
+	rocc->last_to_last_cwnd = rocc_min_cwnd;
+
 	cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
 }
 
@@ -105,6 +111,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	u32 cwnd;
 	bool loss_mode, app_limited;
 	bool is_new_congestion_event;
+	bool last_fast_increase;
 
 	if (!rocc_valid(rocc))
 		return;
@@ -127,7 +134,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	if (rocc->min_rtt_us == U32_MAX)
 		hist_us = U32_MAX;
 	else
-		hist_us = 2 * rocc->min_rtt_us;
+		hist_us = rocc_history_periods * rocc->min_rtt_us;
 
 	// Update intervals
 	timestamp = tsk->tcp_mstamp; // Most recent send/receive
@@ -180,18 +187,6 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		// CCMATIC RULE
 		/**
 		 * if(Ld_f[n][t] > Ld_f[n][t-1]):
-		 *     expr = 1c_f[n][t-1] + 0(S_f[n][t-1]-S_f[n][t-3]) + -1alpha
-		 * else:
-		 *     expr = 1/2c_f[n][t-1] + 1/2(S_f[n][t-1]-S_f[n][t-3]) + 1alpha
-		 *
-		 * if(1c_f[n][t-1] + 0(S_f[n][t-1]-S_f[n][t-3]) + -1expr + 0Indicator(Ld_f[n][t] > Ld_f[n][t-1]) > 0):
-		 *     c_f[n][t] = max(alpha, 0c_f[n][t-1] + 1expr + 0(S_f[n][t-1]-S_f[n][t-3]) + 0alpha)
-		 * else:
-		 *     c_f[n][t] = max(alpha, 1c_f[n][t-1] + 0expr + 0(S_f[n][t-1]-S_f[n][t-3]) + 1alpha)
-		*/
-
-		/**
-		 * if(Ld_f[n][t] > Ld_f[n][t-1]):
 		 *     expr = min(1c_f[n][t-1] + 0(S_f[n][t-1]-S_f[n][t-5]) + -1alpha,
 		 *                1/2c_f[n][t-1] + 1/2(S_f[n][t-1]-S_f[n][t-5]) + 1alpha)
 		 * else:
@@ -199,7 +194,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
          *
 		 * if(1c_f[n][t-1] + 0(S_f[n][t-1]-S_f[n][t-5]) + -1expr + 0Indicator(Ld_f[n][t] > Ld_f[n][t-1]) > 0)
 		 * 	   c_f[n][t] = max(alpha, 0c_f[n][t-1] + 1expr + 0(S_f[n][t-1]-S_f[n][t-5]) + 0alpha)
-		 * elif("Last loss was >= 5 Rm ago and Last fast increase was >= 1 Rm ago"):
+		 * elif("Last loss was >= 5 Rm ago"):
 		 * 	   c_f[n][t] = max(alpha, min(3/2c_f[n][t-1], 0c_f[n][t-1] + 1expr + 0(S_f[n][t-1]-S_f[n][t-5]) + 0alpha))
 		 * else:
 		 * 	   c_f[n][t] = max(alpha, 1c_f[n][t-1] + 0expr + 0(S_f[n][t-1]-S_f[n][t-5]) + 1alpha)
@@ -224,9 +219,18 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 			// Lower bound clamp
 			cwnd = max(cwnd, rocc_min_cwnd);
 			tsk->snd_cwnd = cwnd;
-		}
-		else {
+		} else if (rocc->last_loss_tstamp <
+				   timestamp -
+					   rocc_periods_between_large_loss * rocc->min_rtt_us) {
+			// Fast increase
+			tsk->snd_cwnd = min((tsk->snd_cwnd * 3)/2, target_cwnd);
+		} else {
 			tsk->snd_cwnd = tsk->snd_cwnd + rocc_alpha;
+		}
+
+		last_fast_increase = rocc->last_cwnd > rocc->last_to_last_cwnd + rocc_alpha;
+		if (last_fast_increase && rocc->loss_happened) {
+			tsk->snd_cwnd = rocc->last_to_last_cwnd;
 		}
 
 		sk->sk_pacing_rate = 1000000 * (u64) cwnd * rocc_get_mss(tsk) / rocc->min_rtt_us;
@@ -242,6 +246,9 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		// Set state for next cwnd update
 		rocc->last_update_tstamp = timestamp;
 		rocc->loss_happened = false;
+
+		rocc->last_to_last_cwnd = rocc->last_cwnd;
+		rocc->last_cwnd = tsk->snd_cwnd;
 	}
 }
 
