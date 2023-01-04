@@ -11,6 +11,7 @@ static const u16 rocc_num_intervals = 16;
 // rocc_num_intervals-1
 static const u16 rocc_num_intervals_mask = 15;
 static const u32 rocc_min_cwnd = 2;
+static const u32 rocc_alpha = 1;
 // Maximum tolerable loss rate, expressed as `loss_thresh / 1024`. Calculations
 // are faster if things are powers of 2
 static const u64 rocc_loss_thresh = 64;
@@ -40,6 +41,10 @@ struct rocc_data {
 	bool loss_happened;
 
 	u64 last_update_tstamp;
+
+	u64 last_loss_tstamp;
+	u32 last_cwnd;
+	u32 last_to_last_cwnd;
 };
 
 static void rocc_init(struct sock *sk)
@@ -162,7 +167,10 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	loss_mode = (u64) pkts_lost * 1024 > (u64) (pkts_acked + pkts_lost) * rocc_loss_thresh;
 	is_new_congestion_event = after(rs->last_end_seq, rocc->last_decrease_seq);
 	if(loss_mode && is_new_congestion_event) {
+		// This is called on every ACK, while loss_happened is reset every Rm.
+		// So we need to preserve this variable across calls.
 		rocc->loss_happened = true;
+		rocc->last_loss_tstamp = timestamp;
 	}
 
 	if (timestamp - rocc->last_update_tstamp >= rocc->min_rtt_us) {
@@ -182,11 +190,28 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		 *     c_f[n][t] = max(alpha, 1c_f[n][t-1] + 0expr + 0(S_f[n][t-1]-S_f[n][t-3]) + 1alpha)
 		*/
 
+		/**
+		 * if(Ld_f[n][t] > Ld_f[n][t-1]):
+		 *     expr = min(1c_f[n][t-1] + 0(S_f[n][t-1]-S_f[n][t-5]) + -1alpha,
+		 *                1/2c_f[n][t-1] + 1/2(S_f[n][t-1]-S_f[n][t-5]) + 1alpha)
+		 * else:
+		 *     expr = 1/2c_f[n][t-1] + 1/2(S_f[n][t-1]-S_f[n][t-5]) + 1alpha
+         *
+		 * if(1c_f[n][t-1] + 0(S_f[n][t-1]-S_f[n][t-5]) + -1expr + 0Indicator(Ld_f[n][t] > Ld_f[n][t-1]) > 0)
+		 * 	   c_f[n][t] = max(alpha, 0c_f[n][t-1] + 1expr + 0(S_f[n][t-1]-S_f[n][t-5]) + 0alpha)
+		 * elif("Last loss was >= 5 Rm ago and Last fast increase was >= 1 Rm ago"):
+		 * 	   c_f[n][t] = max(alpha, min(3/2c_f[n][t-1], 0c_f[n][t-1] + 1expr + 0(S_f[n][t-1]-S_f[n][t-5]) + 0alpha))
+		 * else:
+		 * 	   c_f[n][t] = max(alpha, 1c_f[n][t-1] + 0expr + 0(S_f[n][t-1]-S_f[n][t-5]) + 1alpha)
+		 * if("Loss on fast increase"):
+		 * 	   c_f[n][t] = c_f[n][t-2]
+		*/
+
 		// TARGET CWND
-		target_cwnd = (tsk->snd_cwnd + pkts_acked)/2 + 1;
+		target_cwnd = (tsk->snd_cwnd + pkts_acked)/2 + rocc_alpha;
 		if(rocc->loss_happened) {
 			rocc->last_decrease_seq = tsk->snd_nxt;
-			target_cwnd = min(target_cwnd, (tsk->snd_cwnd) - 1);
+			target_cwnd = min(target_cwnd, (tsk->snd_cwnd) - rocc_alpha);
 		}
 
 		// UPDATE CWND
@@ -201,7 +226,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 			tsk->snd_cwnd = cwnd;
 		}
 		else {
-			tsk->snd_cwnd = tsk->snd_cwnd + 1;
+			tsk->snd_cwnd = tsk->snd_cwnd + rocc_alpha;
 		}
 
 		sk->sk_pacing_rate = 1000000 * (u64) cwnd * rocc_get_mss(tsk) / rocc->min_rtt_us;
@@ -237,7 +262,7 @@ static void rocc_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 
 static struct tcp_congestion_ops tcp_rocc_cong_ops __read_mostly = {
 	.flags = TCP_CONG_NON_RESTRICTED,
-	.name = "aitd_combad_rm",
+	.name = "aitd_combad_rm_fi",
 	.owner = THIS_MODULE,
 	.init = rocc_init,
 	.release	= rocc_release,
