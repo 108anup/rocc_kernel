@@ -16,7 +16,7 @@ static const u32 rocc_alpha = 1;
 // are faster if things are powers of 2
 static const u64 rocc_loss_thresh = 64;
 static const u32 rocc_periods_between_large_loss = 8;
-static const u32 rocc_history_periods = 2;
+static const u32 rocc_history_periods = 8;
 
 // To keep track of the number of packets acked over a short period of time
 struct rocc_interval {
@@ -25,6 +25,13 @@ struct rocc_interval {
 	u32 pkts_acked;
 	u32 pkts_lost;
 	bool app_limited;
+	u32 rtt_us;
+};
+
+struct belief_data {
+	u64 min_c;
+	u64 max_c;
+	u32 min_qdel;
 };
 
 static u32 id = 0;
@@ -47,6 +54,8 @@ struct rocc_data {
 	u64 last_loss_tstamp;
 	u32 last_cwnd;
 	u32 last_to_last_cwnd;
+
+	struct belief_data beliefs;
 };
 
 static void rocc_init(struct sock *sk)
@@ -81,6 +90,10 @@ static void rocc_init(struct sock *sk)
 	rocc->last_cwnd = rocc_min_cwnd;
 	rocc->last_to_last_cwnd = rocc_min_cwnd;
 
+	rocc->beliefs.max_c = U32_MAX;
+	rocc->beliefs.min_c = 0;
+	rocc->beliefs.min_qdel = 0;
+
 	cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
 }
 
@@ -96,10 +109,80 @@ static bool rocc_valid(struct rocc_data *rocc)
 	return (rocc && rocc->intervals);
 }
 
+static bool get_loss_mode(u32 pkts_acked, u32 pkts_lost) {
+	bool loss_mode = (u64)pkts_lost * 1024 >
+					 (u64)(pkts_acked + pkts_lost) * rocc_loss_thresh;
+	return loss_mode;
+}
+
+static void update_beliefs(struct rocc_data *rocc, u32 hist_us) {
+	u16 st;
+	u16 et = rocc->intervals_head;  // end time
+
+	u32 this_rtt_us;
+
+	u32 cum_pkts_acked = 0;
+	// u64 cum_ack_rate;
+	u32 window;
+
+	bool this_loss;
+	bool this_high_delay;
+	bool this_utilized;
+	bool cum_utilized;
+
+	struct rocc_interval *this_interval;
+	struct belief_data *beliefs = &rocc->beliefs;
+	u32 interval_length_us = 2 * hist_us / rocc_num_intervals + 1; // round up
+	u32 rtprop = rocc->min_rtt_us;
+	u32 max_jitter = rtprop;
+
+	// The et interval might have just started with very few measurements. So we
+	// ignore measurements in that interval... We can perhaps keep a tstamp of
+	// the last measurement in that interval?
+	for (st = 1; st < rocc_num_intervals; st++) {
+		window = st * interval_length_us;
+		this_interval = &rocc->intervals[(et + st) & rocc_num_intervals_mask];
+		this_rtt_us = this_interval->rtt_us;
+
+		this_high_delay = this_rtt_us > rtprop + max_jitter;
+		this_loss = get_loss_mode(this_interval->pkts_acked, this_interval->pkts_lost);
+		// TODO: loss was detected in this interval does not mean this interval
+		// was utilized. Things were utilized when pkt with sequence number just
+		// less than the lost sequence number was sent.
+		this_utilized = this_loss || this_high_delay;
+		if (st == 1) {
+			cum_utilized = this_utilized;
+		} else {
+			cum_utilized = cum_utilized && this_utilized;
+		}
+
+		// UPDATE QDEL BELIEFS
+		if(this_rtt_us > rtprop + max_jitter) {
+			beliefs->min_qdel = this_rtt_us - rtprop - max_jitter;
+		}
+
+		// UPDATE LINK RATE BELIEFS
+		cum_pkts_acked += this_interval->pkts_acked;
+		// cum_ack_rate =
+		// 	1e6 * cum_pkts_acked / window;
+
+		// current units = MSS/second
+		// TODO: check precision loss here.
+		beliefs->min_c =
+			max(beliefs->min_c, ((u64) 1e6 * cum_pkts_acked) / (window + max_jitter));
+
+		if (cum_utilized) {
+			beliefs->max_c =
+				max(beliefs->max_c, ((u64) 1e6 * cum_pkts_acked) / (window - max_jitter));
+		}
+	}
+}
+
 static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 {
 	struct rocc_data *rocc = inet_csk_ca(sk);
 	struct tcp_sock *tsk = tcp_sk(sk);
+	struct belief_data *beliefs = &rocc->beliefs;
 	u32 rtt_us;
 	u16 i, id;
 	u32 hist_us;
@@ -107,11 +190,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	u32 interval_length;
 	// Number of packets acked and lost in the last `hist_us`
 	u32 pkts_acked, pkts_lost;
-	u32 target_cwnd;
-	u32 cwnd;
 	bool loss_mode, app_limited;
-	bool is_new_congestion_event;
-	bool last_fast_increase;
 
 	if (!rocc_valid(rocc))
 		return;
@@ -121,7 +200,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		return;
 
 	// Get initial RTT - as measured by SYN -> SYN-ACK.  If information
-        // does not exist - use U32_MAX as RTT
+	// does not exist - use U32_MAX as RTT
 	if (tsk->srtt_us) {
 		rtt_us = max(tsk->srtt_us >> 3, 1U);
 	} else {
@@ -150,11 +229,15 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		rocc->intervals[rocc->intervals_head].pkts_acked = rs->acked_sacked;
 		rocc->intervals[rocc->intervals_head].pkts_lost = rs->losses;
 		rocc->intervals[rocc->intervals_head].app_limited = rs->is_app_limited;
+		rocc->intervals[rocc->intervals_head].rtt_us = rs->rtt_us;
 	}
 	else {
 		rocc->intervals[rocc->intervals_head].pkts_acked += rs->acked_sacked;
 		rocc->intervals[rocc->intervals_head].pkts_lost += rs->losses;
 		rocc->intervals[rocc->intervals_head].app_limited |= rs->is_app_limited;
+		// TODO: check what kind of aggregation we want here.
+		rocc->intervals[rocc->intervals_head].rtt_us =
+			min((u32) rs->rtt_us, rocc->intervals[rocc->intervals_head].rtt_us);
 	}
 
 	// Find the statistics from the last `hist` seconds
@@ -172,83 +255,35 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	}
 
 	loss_mode = (u64) pkts_lost * 1024 > (u64) (pkts_acked + pkts_lost) * rocc_loss_thresh;
-	is_new_congestion_event = after(rs->last_end_seq, rocc->last_decrease_seq);
-	if(loss_mode && is_new_congestion_event) {
-		// This is called on every ACK, while loss_happened is reset every Rm.
-		// So we need to preserve this variable across calls.
-		rocc->loss_happened = true;
-		rocc->last_loss_tstamp = timestamp;
-	}
 
+	update_beliefs(rocc, hist_us);
 	if (timestamp - rocc->last_update_tstamp >= rocc->min_rtt_us) {
-		// Propagation delay (Rm) worth of time has elapsed since last cwnd update,
-		// time to make a new update to cwnd.
-
-		// CCMATIC RULE
+		// TODO: Is the update every rtprop time needed, or can we now update
+		// every ACK?
 		/**
-		 * if(Ld_f[n][t] > Ld_f[n][t-1]):
-		 *     expr = min(1c_f[n][t-1] + 0(S_f[n][t-1]-S_f[n][t-5]) + -1alpha,
-		 *                1/2c_f[n][t-1] + 1/2(S_f[n][t-1]-S_f[n][t-5]) + 1alpha)
-		 * else:
-		 *     expr = 1/2c_f[n][t-1] + 1/2(S_f[n][t-1]-S_f[n][t-5]) + 1alpha
-         *
-		 * if(1c_f[n][t-1] + 0(S_f[n][t-1]-S_f[n][t-5]) + -1expr + 0Indicator(Ld_f[n][t] > Ld_f[n][t-1]) > 0)
-		 * 	   c_f[n][t] = max(alpha, 0c_f[n][t-1] + 1expr + 0(S_f[n][t-1]-S_f[n][t-5]) + 0alpha)
-		 * elif("Last loss was >= 5 Rm ago"):
-		 * 	   c_f[n][t] = max(alpha, min(3/2c_f[n][t-1], 0c_f[n][t-1] + 1expr + 0(S_f[n][t-1]-S_f[n][t-5]) + 0alpha))
-		 * else:
-		 * 	   c_f[n][t] = max(alpha, 1c_f[n][t-1] + 0expr + 0(S_f[n][t-1]-S_f[n][t-5]) + 1alpha)
-		 * if("Loss on fast increase"):
-		 * 	   c_f[n][t] = c_f[n][t-2]
-		*/
+		 *  if (+ 1min_c + -1/2max_c > 0):
+		 *		r_f[n][t] = max(alpha,  + 1min_c)
+		 *	else:
+		 *		r_f[n][t] = max(alpha,  + 2min_c)
+		 */
 
-		// TARGET CWND
-		target_cwnd = (tsk->snd_cwnd + pkts_acked)/2 + rocc_alpha;
-		if(rocc->loss_happened) {
-			rocc->last_decrease_seq = tsk->snd_nxt;
-			target_cwnd = min(target_cwnd, (tsk->snd_cwnd) - rocc_alpha);
-		}
-
-		// UPDATE CWND
-		if (tsk->snd_cwnd > target_cwnd) {
-			cwnd = target_cwnd;
-			// Do not decrease cwnd if app limited
-			if (app_limited && cwnd < tsk->snd_cwnd) {
-				cwnd = tsk->snd_cwnd;
-			}
-			// Lower bound clamp
-			cwnd = max(cwnd, rocc_min_cwnd);
-			tsk->snd_cwnd = cwnd;
-		} else if (rocc->last_loss_tstamp <
-				   timestamp -
-					   rocc_periods_between_large_loss * rocc->min_rtt_us) {
-			// Fast increase
-			tsk->snd_cwnd = min((tsk->snd_cwnd * 3)/2, target_cwnd);
+		if(2 * beliefs->min_c > beliefs->max_c) {
+			sk->sk_pacing_rate = beliefs->min_c * rocc_get_mss(tsk);
 		} else {
-			tsk->snd_cwnd = tsk->snd_cwnd + rocc_alpha;
+			sk->sk_pacing_rate = 2 * beliefs->min_c * rocc_get_mss(tsk);
 		}
-
-		last_fast_increase = rocc->last_cwnd > rocc->last_to_last_cwnd + rocc_alpha;
-		if (last_fast_increase && rocc->loss_happened) {
-			tsk->snd_cwnd = rocc->last_to_last_cwnd;
-		}
-
-		sk->sk_pacing_rate = 1000000 * (u64) cwnd * rocc_get_mss(tsk) / rocc->min_rtt_us;
+		tsk->snd_cwnd = 2 * beliefs->max_c * (2 * rocc->min_rtt_us);
 
 #ifdef ROCC_DEBUG
 		printk(KERN_INFO "rocc flow %u cwnd %u pacing %lu rtt %u mss %u timestamp %llu interval %ld", rocc->id, tsk->snd_cwnd, sk->sk_pacing_rate, rtt_us, tsk->mss_cache, timestamp, rs->interval_us);
 		printk(KERN_INFO "rocc pkts_acked %u hist_us %u pacing %lu loss_happened %d app_limited %d rs_limited %d", pkts_acked, hist_us, sk->sk_pacing_rate, (int)rocc->loss_happened, (int)app_limited, (int)rs->is_app_limited);
+		printk(KERN_INFO "rocc min_c %llu max_c %llu min_qdel %u", beliefs->min_c, beliefs->max_c, beliefs->min_qdel);
 		// for (i = 0; i < rocc_num_intervals; ++i) {
 		// 	id = (rocc->intervals_head + i) & rocc_num_intervals_mask;
 		// 	printk(KERN_INFO "rocc intervals %llu acked %u lost %u app_limited %d i %u id %u", rocc->intervals[id].start_us, rocc->intervals[id].pkts_acked, rocc->intervals[id].pkts_lost, (int)rocc->intervals[id].app_limited, i, id);
 		// }
 #endif
-		// Set state for next cwnd update
-		rocc->last_update_tstamp = timestamp;
-		rocc->loss_happened = false;
 
-		rocc->last_to_last_cwnd = rocc->last_cwnd;
-		rocc->last_cwnd = tsk->snd_cwnd;
 	}
 }
 
