@@ -90,7 +90,7 @@ static void rocc_init(struct sock *sk)
 	rocc->last_cwnd = rocc_min_cwnd;
 	rocc->last_to_last_cwnd = rocc_min_cwnd;
 
-	rocc->beliefs.max_c = U32_MAX;
+	rocc->beliefs.max_c = U32_MAX; // even though, max_c is u64, keep it at u32_max so that we can multiply and divide by microseconds.
 	rocc->beliefs.min_c = 0;
 	rocc->beliefs.min_qdel = 0;
 
@@ -173,7 +173,7 @@ static void update_beliefs(struct rocc_data *rocc, u32 hist_us) {
 
 		if (cum_utilized) {
 			beliefs->max_c =
-				max(beliefs->max_c, ((u64) 1e6 * cum_pkts_acked) / (window - max_jitter));
+				min(beliefs->max_c, ((u64) 1e6 * cum_pkts_acked) / (window - max_jitter));
 		}
 	}
 }
@@ -272,16 +272,20 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		} else {
 			sk->sk_pacing_rate = 2 * beliefs->min_c * rocc_get_mss(tsk);
 		}
-		tsk->snd_cwnd = 2 * beliefs->max_c * (2 * rocc->min_rtt_us);
+		if(beliefs->max_c == U32_MAX) {
+			tsk->snd_cwnd = U32_MAX;
+		} else {
+			tsk->snd_cwnd = (2 * beliefs->max_c * (2 * rocc->min_rtt_us)) / ((u64) 1e6);
+		}
 
 #ifdef ROCC_DEBUG
 		printk(KERN_INFO "rocc flow %u cwnd %u pacing %lu rtt %u mss %u timestamp %llu interval %ld", rocc->id, tsk->snd_cwnd, sk->sk_pacing_rate, rtt_us, tsk->mss_cache, timestamp, rs->interval_us);
 		printk(KERN_INFO "rocc pkts_acked %u hist_us %u pacing %lu loss_happened %d app_limited %d rs_limited %d", pkts_acked, hist_us, sk->sk_pacing_rate, (int)rocc->loss_happened, (int)app_limited, (int)rs->is_app_limited);
 		printk(KERN_INFO "rocc min_c %llu max_c %llu min_qdel %u", beliefs->min_c, beliefs->max_c, beliefs->min_qdel);
-		// for (i = 0; i < rocc_num_intervals; ++i) {
-		// 	id = (rocc->intervals_head + i) & rocc_num_intervals_mask;
-		// 	printk(KERN_INFO "rocc intervals %llu acked %u lost %u app_limited %d i %u id %u", rocc->intervals[id].start_us, rocc->intervals[id].pkts_acked, rocc->intervals[id].pkts_lost, (int)rocc->intervals[id].app_limited, i, id);
-		// }
+		for (i = 0; i < rocc_num_intervals; ++i) {
+			id = (rocc->intervals_head + i) & rocc_num_intervals_mask;
+			printk(KERN_INFO "rocc intervals %llu acked %u lost %u app_limited %d i %u id %u", rocc->intervals[id].start_us, rocc->intervals[id].pkts_acked, rocc->intervals[id].pkts_lost, (int)rocc->intervals[id].app_limited, i, id);
+		}
 #endif
 
 	}
