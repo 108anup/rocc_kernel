@@ -4,7 +4,7 @@
 #include <net/tcp.h>
 
 #define ROCC_DEBUG
-// #define U64_S_TO_US ((u64) 1e6)
+#define U64_S_TO_US ((u64) 1e6)
 
 // Should be a power of two so rocc_num_intervals_mask can be set
 static const u16 rocc_num_intervals = 16;
@@ -168,16 +168,16 @@ static void update_beliefs(struct rocc_data *rocc, u32 hist_us) {
 		// UPDATE LINK RATE BELIEFS
 		cum_pkts_acked += this_interval->pkts_acked;
 		// cum_ack_rate =
-		// 	1e6 * cum_pkts_acked / window;
+		// 	U64_S_TO_US * cum_pkts_acked / window;
 
 		// current units = MSS/second
 		// TODO: check precision loss here.
 		beliefs->min_c =
-			max(beliefs->min_c, (((u64) 1e6) * cum_pkts_acked) / (window + max_jitter));
+			max(beliefs->min_c, (U64_S_TO_US * cum_pkts_acked) / (window + max_jitter));
 
 		if (cum_utilized) {
 			beliefs->max_c =
-				min(beliefs->max_c, (((u64) 1e6) * cum_pkts_acked) / (window - max_jitter));
+				min(beliefs->max_c, (U64_S_TO_US * cum_pkts_acked) / (window - max_jitter));
 		}
 	}
 }
@@ -279,11 +279,9 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		} else {
 			sk->sk_pacing_rate = 2 * beliefs->min_c * rocc_get_mss(tsk);
 		}
-		// tsk->snd_cwnd = (u32) 1e6;
-		// tsk->snd_cwnd = (2 * sk->sk_pacing_rate * (2 * rocc->min_rtt_us)) / ((u64) 1e6);
 
 		// jitter + rtprop = 2 * rocc->min_rtt_us
-		tsk->snd_cwnd = (2 * beliefs->max_c * (2 * rocc->min_rtt_us)) / ((u64) 1e6);
+		tsk->snd_cwnd = (2 * beliefs->max_c * (2 * rocc->min_rtt_us)) / U64_S_TO_US;
 
 #ifdef ROCC_DEBUG
 		printk(KERN_INFO "rocc flow %u cwnd %u pacing %lu rtt %u mss %u timestamp %llu interval %ld", rocc->id, tsk->snd_cwnd, sk->sk_pacing_rate, rtt_us, tsk->mss_cache, timestamp, rs->interval_us);
