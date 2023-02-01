@@ -4,6 +4,7 @@
 #include <net/tcp.h>
 
 #define ROCC_DEBUG
+// #define U64_S_TO_US ((u64) 1e6)
 
 // Should be a power of two so rocc_num_intervals_mask can be set
 static const u16 rocc_num_intervals = 16;
@@ -90,7 +91,10 @@ static void rocc_init(struct sock *sk)
 	rocc->last_cwnd = rocc_min_cwnd;
 	rocc->last_to_last_cwnd = rocc_min_cwnd;
 
-	rocc->beliefs.max_c = U32_MAX; // even though, max_c is u64, keep it at u32_max so that we can multiply and divide by microseconds.
+	rocc->beliefs.max_c = (u32) 1e7; // This is roughly 120 Gbps.
+	// Setting this as U32_MAX and then setting cwnd as U32_MAX causes issues
+	// with the kernel... Earlier set as U32_MAX, even though, max_c is u64,
+	// keeping it at u32_max so that we can multiply and divide by microseconds.
 	rocc->beliefs.min_c = 0;
 	rocc->beliefs.min_qdel = 0;
 
@@ -169,11 +173,11 @@ static void update_beliefs(struct rocc_data *rocc, u32 hist_us) {
 		// current units = MSS/second
 		// TODO: check precision loss here.
 		beliefs->min_c =
-			max(beliefs->min_c, ((u64) 1e6 * cum_pkts_acked) / (window + max_jitter));
+			max(beliefs->min_c, (((u64) 1e6) * cum_pkts_acked) / (window + max_jitter));
 
 		if (cum_utilized) {
 			beliefs->max_c =
-				min(beliefs->max_c, ((u64) 1e6 * cum_pkts_acked) / (window - max_jitter));
+				min(beliefs->max_c, (((u64) 1e6) * cum_pkts_acked) / (window - max_jitter));
 		}
 	}
 }
@@ -191,6 +195,9 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	// Number of packets acked and lost in the last `hist_us`
 	u32 pkts_acked, pkts_lost;
 	bool loss_mode, app_limited;
+
+	// printk(KERN_INFO "rocc rate_sample rs_timestamp %llu tcp_timestamp %llu delivered %d", tsk->tcp_mstamp, rs->prior_mstamp);
+	// printk(KERN_INFO "rocc rate_sample acked_sacked %u last_end_seq %u snd_nxt % u rcv_nxt %u", rs->acked_sacked, rs->last_end_seq, tsk->snd_nxt, tsk->rcv_nxt);
 
 	if (!rocc_valid(rocc))
 		return;
@@ -272,11 +279,11 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		} else {
 			sk->sk_pacing_rate = 2 * beliefs->min_c * rocc_get_mss(tsk);
 		}
-		if(beliefs->max_c == U32_MAX) {
-			tsk->snd_cwnd = U32_MAX;
-		} else {
-			tsk->snd_cwnd = (2 * beliefs->max_c * (2 * rocc->min_rtt_us)) / ((u64) 1e6);
-		}
+		// tsk->snd_cwnd = (u32) 1e6;
+		// tsk->snd_cwnd = (2 * sk->sk_pacing_rate * (2 * rocc->min_rtt_us)) / ((u64) 1e6);
+
+		// jitter + rtprop = 2 * rocc->min_rtt_us
+		tsk->snd_cwnd = (2 * beliefs->max_c * (2 * rocc->min_rtt_us)) / ((u64) 1e6);
 
 #ifdef ROCC_DEBUG
 		printk(KERN_INFO "rocc flow %u cwnd %u pacing %lu rtt %u mss %u timestamp %llu interval %ld", rocc->id, tsk->snd_cwnd, sk->sk_pacing_rate, rtt_us, tsk->mss_cache, timestamp, rs->interval_us);
