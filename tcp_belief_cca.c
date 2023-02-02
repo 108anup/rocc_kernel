@@ -27,6 +27,10 @@ struct rocc_interval {
 	u32 pkts_lost;
 	bool app_limited;
 	u32 rtt_us;
+
+	// metrics at interval creation time
+	u64 ic_rs_prior_mstamp;
+	u32 ic_rs_prior_delivered;
 };
 
 struct belief_data {
@@ -71,6 +75,9 @@ static void rocc_init(struct sock *sk)
 		rocc->intervals[i].pkts_acked = 0;
 		rocc->intervals[i].pkts_lost = 0;
 		rocc->intervals[i].app_limited = false;
+
+		rocc->intervals[i].ic_rs_prior_mstamp = 0;
+		rocc->intervals[i].ic_rs_prior_delivered = 0;
 	}
 	rocc->intervals_head = 0;
 
@@ -119,12 +126,14 @@ static bool get_loss_mode(u32 pkts_acked, u32 pkts_lost) {
 	return loss_mode;
 }
 
-static void update_beliefs(struct rocc_data *rocc, u32 hist_us) {
+static void update_beliefs(struct rocc_data *rocc) {
 	u16 st;
 	u16 et = rocc->intervals_head;  // end time
+	u64 et_tstamp = rocc->intervals[et].start_us;
 
 	u32 this_rtt_us;
 
+	u64 st_tstamp;
 	u32 cum_pkts_acked = 0;
 	// u64 cum_ack_rate;
 	u32 window;
@@ -136,7 +145,6 @@ static void update_beliefs(struct rocc_data *rocc, u32 hist_us) {
 
 	struct rocc_interval *this_interval;
 	struct belief_data *beliefs = &rocc->beliefs;
-	u32 interval_length_us = 2 * hist_us / rocc_num_intervals + 1; // round up
 	u32 rtprop = rocc->min_rtt_us;
 	u32 max_jitter = rtprop;
 
@@ -144,9 +152,10 @@ static void update_beliefs(struct rocc_data *rocc, u32 hist_us) {
 	// ignore measurements in that interval... We can perhaps keep a tstamp of
 	// the last measurement in that interval?
 	for (st = 1; st < rocc_num_intervals; st++) {
-		window = st * interval_length_us;
 		this_interval = &rocc->intervals[(et + st) & rocc_num_intervals_mask];
 		this_rtt_us = this_interval->rtt_us;
+		st_tstamp = this_interval->start_us;
+		window = tcp_stamp_us_delta(et_tstamp, st_tstamp);
 
 		this_high_delay = this_rtt_us > rtprop + max_jitter;
 		this_loss = get_loss_mode(this_interval->pkts_acked, this_interval->pkts_lost);
@@ -175,7 +184,7 @@ static void update_beliefs(struct rocc_data *rocc, u32 hist_us) {
 		beliefs->min_c =
 			max(beliefs->min_c, (U64_S_TO_US * cum_pkts_acked) / (window + max_jitter));
 
-		if (cum_utilized) {
+		if (cum_utilized && st > 1) {
 			beliefs->max_c =
 				min(beliefs->max_c, (U64_S_TO_US * cum_pkts_acked) / (window - max_jitter));
 		}
@@ -195,6 +204,11 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	// Number of packets acked and lost in the last `hist_us`
 	u32 pkts_acked, pkts_lost;
 	bool loss_mode, app_limited;
+
+	u32 window = 0;
+	u32 ic_rs_window = 0;
+	u16 nid;
+	s32 delivered_delta = 0;
 
 	// printk(KERN_INFO "rocc rate_sample rs_timestamp %llu tcp_timestamp %llu delivered %d", tsk->tcp_mstamp, rs->prior_mstamp);
 	// printk(KERN_INFO "rocc rate_sample acked_sacked %u last_end_seq %u snd_nxt % u rcv_nxt %u", rs->acked_sacked, rs->last_end_seq, tsk->snd_nxt, tsk->rcv_nxt);
@@ -237,6 +251,9 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		rocc->intervals[rocc->intervals_head].pkts_lost = rs->losses;
 		rocc->intervals[rocc->intervals_head].app_limited = rs->is_app_limited;
 		rocc->intervals[rocc->intervals_head].rtt_us = rs->rtt_us;
+		rocc->intervals[rocc->intervals_head].ic_rs_prior_mstamp = rs->prior_mstamp;
+		rocc->intervals[rocc->intervals_head].ic_rs_prior_delivered = rs->prior_delivered;
+		update_beliefs(rocc);
 	}
 	else {
 		rocc->intervals[rocc->intervals_head].pkts_acked += rs->acked_sacked;
@@ -263,8 +280,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 
 	loss_mode = (u64) pkts_lost * 1024 > (u64) (pkts_acked + pkts_lost) * rocc_loss_thresh;
 
-	update_beliefs(rocc, hist_us);
-	if (timestamp - rocc->last_update_tstamp >= rocc->min_rtt_us) {
+	if (tcp_stamp_us_delta(timestamp, rocc->last_update_tstamp) >= rocc->min_rtt_us) {
 		// TODO: Is the update every rtprop time needed, or can we now update
 		// every ACK?
 		/**
@@ -284,12 +300,44 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		tsk->snd_cwnd = (2 * beliefs->max_c * (2 * rocc->min_rtt_us)) / U64_S_TO_US;
 
 #ifdef ROCC_DEBUG
-		printk(KERN_INFO "rocc flow %u cwnd %u pacing %lu rtt %u mss %u timestamp %llu interval %ld", rocc->id, tsk->snd_cwnd, sk->sk_pacing_rate, rtt_us, tsk->mss_cache, timestamp, rs->interval_us);
-		printk(KERN_INFO "rocc pkts_acked %u hist_us %u pacing %lu loss_happened %d app_limited %d rs_limited %d", pkts_acked, hist_us, sk->sk_pacing_rate, (int)rocc->loss_happened, (int)app_limited, (int)rs->is_app_limited);
-		printk(KERN_INFO "rocc min_c %llu max_c %llu min_qdel %u", beliefs->min_c, beliefs->max_c, beliefs->min_qdel);
+		printk(KERN_INFO
+			   "rocc flow %u cwnd %u pacing %lu rtt %u mss %u timestamp %llu "
+			   "interval %ld",
+			   rocc->id, tsk->snd_cwnd, sk->sk_pacing_rate, rtt_us,
+			   tsk->mss_cache, timestamp, rs->interval_us);
+		printk(KERN_INFO
+			   "rocc pkts_acked %u hist_us %u pacing %lu loss_happened %d "
+			   "app_limited %d rs_limited %d",
+			   pkts_acked, hist_us, sk->sk_pacing_rate,
+			   (int)rocc->loss_happened, (int)app_limited,
+			   (int)rs->is_app_limited);
+		printk(KERN_INFO "rocc min_c %llu max_c %llu min_qdel %u",
+			   beliefs->min_c, beliefs->max_c, beliefs->min_qdel);
 		for (i = 0; i < rocc_num_intervals; ++i) {
 			id = (rocc->intervals_head + i) & rocc_num_intervals_mask;
-			printk(KERN_INFO "rocc intervals %llu acked %u lost %u app_limited %d i %u id %u", rocc->intervals[id].start_us, rocc->intervals[id].pkts_acked, rocc->intervals[id].pkts_lost, (int)rocc->intervals[id].app_limited, i, id);
+			nid = (id - 1) & rocc_num_intervals_mask;  // next id
+			if (i >= 1) {
+				window = tcp_stamp_us_delta(rocc->intervals[nid].start_us,
+											rocc->intervals[id].start_us);
+				ic_rs_window =
+					tcp_stamp_us_delta(rocc->intervals[nid].ic_rs_prior_mstamp,
+									   rocc->intervals[id].ic_rs_prior_mstamp);
+				delivered_delta =
+					(rocc->intervals[nid].ic_rs_prior_delivered -
+					 rocc->intervals[id].ic_rs_prior_delivered);
+			}
+			printk(KERN_INFO
+				   "rocc intervals start_us %llu window %u acked %u lost %u "
+				   "ic_rs_prior_mstamp %llu ic_rs_prior_delivered %u "
+				   "ic_rs_window %u delivered_delta %d "
+				   "app_limited %d i %u id %u",
+				   rocc->intervals[id].start_us, window,
+				   rocc->intervals[id].pkts_acked,
+				   rocc->intervals[id].pkts_lost,
+				   rocc->intervals[id].ic_rs_prior_mstamp,
+				   rocc->intervals[id].ic_rs_prior_delivered, ic_rs_window,
+				   delivered_delta, (int)rocc->intervals[id].app_limited,
+				   i, id);
 		}
 #endif
 
