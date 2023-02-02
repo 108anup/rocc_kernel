@@ -182,11 +182,11 @@ static void update_beliefs(struct rocc_data *rocc) {
 		// current units = MSS/second
 		// TODO: check precision loss here.
 		beliefs->min_c =
-			max(beliefs->min_c, (U64_S_TO_US * cum_pkts_acked) / (window + max_jitter));
+			max_t(u64, beliefs->min_c, (U64_S_TO_US * cum_pkts_acked) / (window + max_jitter));
 
 		if (cum_utilized && st > 1) {
 			beliefs->max_c =
-				min(beliefs->max_c, (U64_S_TO_US * cum_pkts_acked) / (window - max_jitter));
+				min_t(u64, beliefs->max_c, (U64_S_TO_US * cum_pkts_acked) / (window - max_jitter));
 		}
 	}
 }
@@ -261,7 +261,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		rocc->intervals[rocc->intervals_head].app_limited |= rs->is_app_limited;
 		// TODO: check what kind of aggregation we want here.
 		rocc->intervals[rocc->intervals_head].rtt_us =
-			min((u32) rs->rtt_us, rocc->intervals[rocc->intervals_head].rtt_us);
+			min_t(u32, (u32) rs->rtt_us, rocc->intervals[rocc->intervals_head].rtt_us);
 	}
 
 	// Find the statistics from the last `hist` seconds
@@ -298,6 +298,10 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 
 		// jitter + rtprop = 2 * rocc->min_rtt_us
 		tsk->snd_cwnd = (2 * beliefs->max_c * (2 * rocc->min_rtt_us)) / U64_S_TO_US;
+
+		// lower bound clamps
+		tsk->snd_cwnd = max_t(u32, tsk->snd_cwnd, rocc_alpha);
+		sk->sk_pacing_rate = max_t(u64, sk->sk_pacing_rate, (rocc_alpha * rocc_get_mss(tsk) * U64_S_TO_US) / rocc->min_rtt_us);
 
 #ifdef ROCC_DEBUG
 		printk(KERN_INFO
