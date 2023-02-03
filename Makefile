@@ -1,7 +1,7 @@
 ifneq ($(KERNELRELEASE),)
 
 # kbuild part of makefile
-obj-m  := tcp_belief_cca.o
+obj-m  := tcp_belief_cca_timeout.o
 
 else
 # normal makefile
