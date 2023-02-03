@@ -163,6 +163,10 @@ static void update_beliefs(struct rocc_data *rocc) {
 	u64 new_min_c = 0;
 	u64 new_max_c = INIT_MAX_C;
 
+	u64 now = et_tstamp;
+	u32 time_since_last_timeout = tcp_stamp_us_delta(now, rocc->last_timeout_tstamp);
+	bool timeout = time_since_last_timeout > rocc_timeout_period * rocc->min_rtt_us;
+
 	// The et interval might have just started with very few measurements. So we
 	// ignore measurements in that interval... We can perhaps keep a tstamp of
 	// the last measurement in that interval?
@@ -206,15 +210,11 @@ static void update_beliefs(struct rocc_data *rocc) {
 
 	}
 
-	u64 now = et_tstamp;
-	u32 time_since_last_timeout = tcp_stamp_us_delta(now, rocc->last_timeout_tstamp);
-	bool timeout = time_since_last_timeout > rocc_timeout_period * rocc->min_rtt_us;
-
 	if(timeout) {
-		bool minc_changed = new_min_c > rocc->last_min_c;
-		bool maxc_changed = new_max_c < rocc->last_max_c;
-		bool minc_changed_significantly = new_min_c > (rocc_significant_mult_percent * rocc->last_min_c) / 100;
-		bool maxc_changed_significantly = (new_max_c * rocc_significant_mult_percent) / 100 < rocc->last_max_c;
+		bool minc_changed = new_min_c > rocc->last_timeout_minc;
+		bool maxc_changed = new_max_c < rocc->last_timeout_maxc;
+		bool minc_changed_significantly = new_min_c > (rocc_significant_mult_percent * rocc->last_timeout_minc) / 100;
+		bool maxc_changed_significantly = (new_max_c * rocc_significant_mult_percent) / 100 < rocc->last_timeout_maxc;
 		bool beliefs_invalid = new_max_c < new_min_c;
 		bool minc_came_close = minc_changed && beliefs_invalid;
 		bool maxc_came_close = maxc_changed && beliefs_invalid;
