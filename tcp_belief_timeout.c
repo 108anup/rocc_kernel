@@ -417,7 +417,7 @@ static void rocc_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 
 static struct tcp_congestion_ops tcp_rocc_cong_ops __read_mostly = {
 	.flags = TCP_CONG_NON_RESTRICTED,
-	.name = "belief_cca",
+	.name = "belief_timeout",
 	.owner = THIS_MODULE,
 	.init = rocc_init,
 	.release	= rocc_release,
