@@ -5,6 +5,8 @@
 
 #define ROCC_DEBUG
 #define U64_S_TO_US ((u64) 1e6)
+#define INIT_MAX_C ((u32) 1e7)
+// ^^ This is roughly 120 Gbps.
 
 // Should be a power of two so rocc_num_intervals_mask can be set
 static const u16 rocc_num_intervals = 16;
@@ -18,6 +20,8 @@ static const u32 rocc_alpha = 1;
 static const u64 rocc_loss_thresh = 64;
 static const u32 rocc_periods_between_large_loss = 8;
 static const u32 rocc_history_periods = 8;
+static const u32 rocc_timeout_period = 10;
+static const u32 rocc_significant_mult_percent = 110;
 
 // To keep track of the number of packets acked over a short period of time
 struct rocc_interval {
@@ -61,6 +65,10 @@ struct rocc_data {
 	u32 last_to_last_cwnd;
 
 	struct belief_data beliefs;
+
+	u64 last_timeout_tstamp;
+	u64 last_timeout_minc;
+	u64 last_timeout_maxc;
 };
 
 static void rocc_init(struct sock *sk)
@@ -98,12 +106,16 @@ static void rocc_init(struct sock *sk)
 	rocc->last_cwnd = rocc_min_cwnd;
 	rocc->last_to_last_cwnd = rocc_min_cwnd;
 
-	rocc->beliefs.max_c = (u32) 1e7; // This is roughly 120 Gbps.
+	rocc->beliefs.max_c = INIT_MAX_C;
 	// Setting this as U32_MAX and then setting cwnd as U32_MAX causes issues
 	// with the kernel... Earlier set as U32_MAX, even though, max_c is u64,
 	// keeping it at u32_max so that we can multiply and divide by microseconds.
 	rocc->beliefs.min_c = 0;
 	rocc->beliefs.min_qdel = 0;
+
+	rocc->last_timeout_tstamp = 0;
+	rocc->last_timeout_minc = 0;
+	rocc->last_timeout_maxc = INIT_MAX_C;
 
 	cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
 }
@@ -148,6 +160,9 @@ static void update_beliefs(struct rocc_data *rocc) {
 	u32 rtprop = rocc->min_rtt_us;
 	u32 max_jitter = rtprop;
 
+	u64 new_min_c = 0;
+	u64 new_max_c = INIT_MAX_C;
+
 	// The et interval might have just started with very few measurements. So we
 	// ignore measurements in that interval... We can perhaps keep a tstamp of
 	// the last measurement in that interval?
@@ -181,13 +196,50 @@ static void update_beliefs(struct rocc_data *rocc) {
 
 		// current units = MSS/second
 		// TODO: check precision loss here.
-		beliefs->min_c =
-			max_t(u64, beliefs->min_c, (U64_S_TO_US * cum_pkts_acked) / (window + max_jitter));
+		new_min_c =
+			max_t(u64, new_min_c, (U64_S_TO_US * cum_pkts_acked) / (window + max_jitter));
 
 		if (cum_utilized && st > 1) {
-			beliefs->max_c =
-				min_t(u64, beliefs->max_c, (U64_S_TO_US * cum_pkts_acked) / (window - max_jitter));
+			new_max_c =
+				min_t(u64, new_max_c, (U64_S_TO_US * cum_pkts_acked) / (window - max_jitter));
 		}
+
+	}
+
+	u64 now = et_tstamp;
+	u32 time_since_last_timeout = tcp_stamp_us_delta(now, rocc->last_timeout_tstamp);
+	bool timeout = time_since_last_timeout > rocc_timeout_period * rocc->min_rtt_us;
+
+	if(timeout) {
+		bool minc_changed = new_min_c > rocc->last_min_c;
+		bool maxc_changed = new_max_c < rocc->last_max_c;
+		bool minc_changed_significantly = new_min_c > (rocc_significant_mult_percent * rocc->last_min_c) / 100;
+		bool maxc_changed_significantly = (new_max_c * rocc_significant_mult_percent) / 100 < rocc->last_max_c;
+		bool beliefs_invalid = new_max_c < new_min_c;
+		bool minc_came_close = minc_changed && beliefs_invalid;
+		bool maxc_came_close = maxc_changed && beliefs_invalid;
+		bool timeout_minc = !minc_changed && (maxc_came_close || !maxc_changed_significantly);
+		bool timeout_maxc = !maxc_changed && (minc_came_close || !minc_changed_significantly);
+
+		if(timeout_minc) {
+			beliefs->min_c = new_min_c;
+		} else {
+			beliefs->min_c = max_t(u64, beliefs->min_c, new_min_c);
+		}
+
+		if(timeout_maxc) {
+			beliefs->max_c = min_t(u64, (beliefs->max_c * 3) / 2, new_max_c);
+		} else {
+			beliefs->max_c = min_t(u64, beliefs->max_c, new_max_c);
+		}
+
+		rocc->last_timeout_tstamp = now;
+		rocc->last_timeout_minc = beliefs->min_c;
+		rocc->last_timeout_maxc = beliefs->max_c;
+	}
+	else {
+		beliefs->min_c = max_t(u64, beliefs->min_c, new_min_c);
+		beliefs->max_c = min_t(u64, beliefs->max_c, new_max_c);
 	}
 }
 
