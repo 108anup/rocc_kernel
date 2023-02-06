@@ -20,7 +20,7 @@ static const u32 rocc_alpha = 1;
 static const u64 rocc_loss_thresh = 64;
 static const u32 rocc_periods_between_large_loss = 8;
 static const u32 rocc_history_periods = 8;
-static const u32 rocc_timeout_period = 10;
+static const u32 rocc_timeout_period = 12;
 static const u32 rocc_significant_mult_percent = 110;
 
 // To keep track of the number of packets acked over a short period of time
@@ -336,16 +336,23 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		// TODO: Is the update every rtprop time needed, or can we now update
 		// every ACK?
 		/**
-		 *  if (+ 1min_c + -1/2max_c > 0):
-		 *		r_f[n][t] = max(alpha,  + 1min_c)
+		 * [01/11 08:17:45]  28: if (+ 1min_qdel + -2 > 0):
+		 **		r_f[n][t] = max(alpha, 1/2min_c)           Better delay
+		 *	elif (+ -1min_c + 1/2max_c > 0):
+		 **	elif (+ -3/2min_c + max_c > 0):                Better utilization
+		 *		r_f[n][t] = max(alpha, 2min_c)
+		 **		r_f[n][t] = max(alpha, 3/2min_c)           Better loss
 		 *	else:
-		 *		r_f[n][t] = max(alpha,  + 2min_c)
-		 */
+		 *		r_f[n][t] = max(alpha, 1min_c)
+		*/
 
-		if(2 * beliefs->min_c > beliefs->max_c) {
+		if(beliefs->min_qdel > 2 * rocc->min_rtt_us) {
+			sk->sk_pacing_rate = (beliefs->min_c * rocc_get_mss(tsk)) / 2;
+		}
+		else if(3 * beliefs->min_c > 2 * beliefs->max_c) {
 			sk->sk_pacing_rate = beliefs->min_c * rocc_get_mss(tsk);
 		} else {
-			sk->sk_pacing_rate = 2 * beliefs->min_c * rocc_get_mss(tsk);
+			sk->sk_pacing_rate = 3/2 * beliefs->min_c * rocc_get_mss(tsk);
 		}
 
 		// jitter + rtprop = 2 * rocc->min_rtt_us
@@ -417,7 +424,7 @@ static void rocc_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 
 static struct tcp_congestion_ops tcp_rocc_cong_ops __read_mostly = {
 	.flags = TCP_CONG_NON_RESTRICTED,
-	.name = "belief_timeout",
+	.name = "belief_timeout_opt",
 	.owner = THIS_MODULE,
 	.init = rocc_init,
 	.release	= rocc_release,
