@@ -352,7 +352,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		else if(3 * beliefs->min_c > 2 * beliefs->max_c) {
 			sk->sk_pacing_rate = beliefs->min_c * rocc_get_mss(tsk);
 		} else {
-			sk->sk_pacing_rate = 3/2 * beliefs->min_c * rocc_get_mss(tsk);
+			sk->sk_pacing_rate = (3 * beliefs->min_c * rocc_get_mss(tsk)) / 2;
 		}
 
 		// jitter + rtprop = 2 * rocc->min_rtt_us
