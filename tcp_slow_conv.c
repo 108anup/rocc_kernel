@@ -47,6 +47,7 @@ struct rocc_interval {
 	u64 ic_bytes_sent;
 
 	bool processed;
+	bool invalid;
 };
 
 struct belief_data {
@@ -91,7 +92,7 @@ static void rocc_init(struct sock *sk)
 	struct rocc_data *rocc = inet_csk_ca(sk);
 	u16 i;
 
-	rocc->intervals = (struct rocc_interval *) kzalloc(sizeof(struct rocc_interval) * rocc_num_intervals,
+	rocc->intervals = kzalloc(sizeof(*(rocc->intervals)) * rocc_num_intervals,
 				  GFP_KERNEL);
 	for (i = 0; i < rocc_num_intervals; ++i) {
 		rocc->intervals[i].start_us = 0;
@@ -106,6 +107,7 @@ static void rocc_init(struct sock *sk)
 		rocc->intervals[i].ic_bytes_sent = 0;
 
 		rocc->intervals[i].processed = false;
+		rocc->intervals[i].invalid = true;
 	}
 	rocc->intervals_head = 0;
 
@@ -126,7 +128,7 @@ static void rocc_init(struct sock *sk)
 	rocc->last_cwnd = rocc_min_cwnd;
 	rocc->last_to_last_cwnd = rocc_min_cwnd;
 
-	rocc->beliefs = (struct belief_data *) kzalloc(sizeof(struct belief_data), GFP_KERNEL);
+	rocc->beliefs = kzalloc(sizeof(*(rocc->beliefs)), GFP_KERNEL);
 	rocc->beliefs->max_c = INIT_MAX_C;
 	// Setting this as U32_MAX and then setting cwnd as U32_MAX causes issues
 	// with the kernel... Earlier set as U32_MAX, even though, max_c is u64,
@@ -142,6 +144,7 @@ static void rocc_init(struct sock *sk)
 	rocc->state = SLOW_START;
 
 	cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
+	// printk(KERN_INFO "ROCC: Initialized ROCC with max_c %llu", rocc->beliefs->max_c);
 }
 
 static u32 rocc_get_mss(struct tcp_sock *tsk)
@@ -162,7 +165,10 @@ static bool get_loss_mode(u32 pkts_acked, u32 pkts_lost) {
 	return loss_mode;
 }
 
-static void update_beliefs(struct rocc_data *rocc) {
+static void update_beliefs(struct sock *sk) {
+	struct tcp_sock *tsk = tcp_sk(sk);
+	struct rocc_data *rocc = inet_csk_ca(sk);
+
 	u16 st;
 	u16 et = rocc->intervals_head;  // end time
 	u64 et_tstamp = rocc->intervals[et].start_us;
@@ -186,6 +192,8 @@ static void update_beliefs(struct rocc_data *rocc) {
 
 	u64 new_min_c = 0;
 	u64 new_max_c = INIT_MAX_C;
+	u64 rocc_alpha_rate = (rocc_alpha_segments * rocc_get_mss(tsk) * U64_S_TO_US) / rocc->min_rtt_us;
+	u64 max_c_lower_clamp = max_t(u64, 2, rocc_alpha_rate);
 
 	u64 now = et_tstamp;
 	u32 time_since_last_timeout = tcp_stamp_us_delta(now, rocc->last_timeout_tstamp);
@@ -196,6 +204,8 @@ static void update_beliefs(struct rocc_data *rocc) {
 	// can perhaps keep a tstamp of the last measurement in that interval?
 	for (st = 1; st < rocc_num_intervals; st++) {
 		this_interval = &rocc->intervals[(et + st) & rocc_num_intervals_mask];
+		if (this_interval->invalid) break;
+
 		this_min_rtt_us = this_interval->min_rtt_us;
 		st_tstamp = this_interval->start_us;
 		window = tcp_stamp_us_delta(et_tstamp, st_tstamp);
@@ -214,7 +224,7 @@ static void update_beliefs(struct rocc_data *rocc) {
 
 		// UPDATE QDEL BELIEFS
 		if(this_min_rtt_us > rtprop + max_jitter) {
-			beliefs->min_qdel = this_min_rtt_us - rtprop - max_jitter;
+			beliefs->min_qdel = this_min_rtt_us - (rtprop + max_jitter);
 		}
 
 		// UPDATE LINK RATE BELIEFS
@@ -264,6 +274,8 @@ static void update_beliefs(struct rocc_data *rocc) {
 		beliefs->min_c = max_t(u64, beliefs->min_c, new_min_c);
 		beliefs->max_c = min_t(u64, beliefs->max_c, new_max_c);
 	}
+	beliefs->max_c = max_t(u64, beliefs->max_c, max_c_lower_clamp);
+	// printk(KERN_INFO "after update max_c %llu new_max_c %llu", rocc->beliefs->max_c, new_max_c);
 }
 
 static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
@@ -400,7 +412,8 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		rocc->intervals[rocc->intervals_head].ic_rs_prior_mstamp = rs->prior_mstamp;
 		rocc->intervals[rocc->intervals_head].ic_rs_prior_delivered = rs->prior_delivered;
 		rocc->intervals[rocc->intervals_head].processed = false;
-		update_beliefs(rocc);
+		rocc->intervals[rocc->intervals_head].invalid = false;
+		update_beliefs(sk);
 		update_beliefs_send(sk, rs);
 	}
 	else {
@@ -433,9 +446,13 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	if(loss_mode) rocc->state = CONG_AVOID;
 
 	if (tcp_stamp_us_delta(timestamp, rocc->last_update_tstamp) >= rocc->min_rtt_us) {
-
 		if(rocc->state == SLOW_START) {
-			sk->sk_pacing_rate = 2 * sk->sk_pacing_rate;
+			if(beliefs->min_qdel > rocc->min_rtt_us) {
+				sk->sk_pacing_rate = (beliefs->min_c * rocc_get_mss(tsk)) / 2;
+			}
+			else {
+				sk->sk_pacing_rate = 2 * beliefs->min_c * rocc_get_mss(tsk);
+			}
 		}
 		else {
 			if(rocc->state != CONG_AVOID) {
@@ -468,9 +485,9 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 #ifdef ROCC_DEBUG
 		printk(KERN_INFO
 			   "rocc flow %u cwnd %u pacing %lu rtt %u mss %u timestamp %llu "
-			   "interval %ld",
+			   "interval %ld state %d",
 			   rocc->id, tsk->snd_cwnd, sk->sk_pacing_rate, rtt_us,
-			   tsk->mss_cache, timestamp, rs->interval_us);
+			   tsk->mss_cache, timestamp, rs->interval_us, rocc->state);
 		printk(KERN_INFO
 			   "rocc pkts_acked %u hist_us %u pacing %lu loss_happened %d "
 			   "app_limited %d rs_limited %d latest_inflight_segments %u",
@@ -506,8 +523,9 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 				   i, id);
 		}
 #endif
-
 	}
+	// printk(KERN_INFO "rocc_process_sample got rtt_us %lu", rs->rtt_us);
+	// printk(KERN_INFO "rocc_process_sample cwnd %u pacing %lu", tsk->snd_cwnd, sk->sk_pacing_rate);
 }
 
 static void rocc_release(struct sock *sk)
