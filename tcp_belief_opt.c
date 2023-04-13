@@ -14,7 +14,7 @@ static const u16 rocc_num_intervals = 16;
 // rocc_num_intervals-1
 static const u16 rocc_num_intervals_mask = 15;
 static const u32 rocc_min_cwnd = 2;
-static const u32 rocc_alpha = 1;
+static const u32 rocc_alpha_segments = 1;
 // Maximum tolerable loss rate, expressed as `loss_thresh / 1024`. Calculations
 // are faster if things are powers of 2
 static const u64 rocc_loss_thresh = 64;
@@ -333,6 +333,8 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	loss_mode = (u64) pkts_lost * 1024 > (u64) (pkts_acked + pkts_lost) * rocc_loss_thresh;
 
 	if (tcp_stamp_us_delta(timestamp, rocc->last_update_tstamp) >= rocc->min_rtt_us) {
+		rocc->last_update_tstamp = timestamp;
+
 		// TODO: Is the update every rtprop time needed, or can we now update
 		// every ACK?
 		/**
@@ -359,8 +361,8 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		tsk->snd_cwnd = (2 * beliefs->max_c * (2 * rocc->min_rtt_us)) / U64_S_TO_US;
 
 		// lower bound clamps
-		tsk->snd_cwnd = max_t(u32, tsk->snd_cwnd, rocc_alpha);
-		sk->sk_pacing_rate = max_t(u64, sk->sk_pacing_rate, (rocc_alpha * rocc_get_mss(tsk) * U64_S_TO_US) / rocc->min_rtt_us);
+		tsk->snd_cwnd = max_t(u32, tsk->snd_cwnd, rocc_alpha_segments);
+		sk->sk_pacing_rate = max_t(u64, sk->sk_pacing_rate, (rocc_alpha_segments * rocc_get_mss(tsk) * U64_S_TO_US) / rocc->min_rtt_us);
 
 #ifdef ROCC_DEBUG
 		printk(KERN_INFO
