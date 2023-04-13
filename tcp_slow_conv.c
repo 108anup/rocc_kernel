@@ -2,6 +2,7 @@
  */
 
 #include <net/tcp.h>
+#include <linux/build_bug.h>
 
 #define ROCC_DEBUG
 #define U64_S_TO_US ((u64) 1e6)
@@ -14,7 +15,7 @@ static const u16 rocc_num_intervals = 16;
 // rocc_num_intervals-1
 static const u16 rocc_num_intervals_mask = 15;
 static const u32 rocc_min_cwnd = 2;
-static const u32 rocc_alpha = 1;
+static const u32 rocc_alpha_segments = 1;
 // Maximum tolerable loss rate, expressed as `loss_thresh / 1024`. Calculations
 // are faster if things are powers of 2
 static const u64 rocc_loss_thresh = 64;
@@ -49,10 +50,10 @@ struct rocc_interval {
 };
 
 struct belief_data {
-	u64 min_c;
-	u64 max_c;
-	u32 min_qdel;
-	u64 min_c_lambda;
+	u64 min_c;  // segments or packets per second
+	u64 max_c;  // segments or packets per second
+	u32 min_qdel;  // in microseconds
+	u64 min_c_lambda;  // segments or packets per second
 };
 
 static u32 id = 0;
@@ -76,7 +77,7 @@ struct rocc_data {
 	u32 last_cwnd;
 	u32 last_to_last_cwnd;
 
-	struct belief_data beliefs;
+	struct belief_data *beliefs;
 
 	u64 last_timeout_tstamp;
 	u64 last_timeout_minc;
@@ -90,14 +91,14 @@ static void rocc_init(struct sock *sk)
 	struct rocc_data *rocc = inet_csk_ca(sk);
 	u16 i;
 
-	rocc->intervals = kzalloc(sizeof(struct rocc_interval) * rocc_num_intervals,
+	rocc->intervals = (struct rocc_interval *) kzalloc(sizeof(struct rocc_interval) * rocc_num_intervals,
 				  GFP_KERNEL);
 	for (i = 0; i < rocc_num_intervals; ++i) {
 		rocc->intervals[i].start_us = 0;
 		rocc->intervals[i].pkts_acked = 0;
 		rocc->intervals[i].pkts_lost = 0;
 		rocc->intervals[i].app_limited = false;
-		rocc->intervals[i].min_rtt_us = U64_MAX;
+		rocc->intervals[i].min_rtt_us = U32_MAX;
 		rocc->intervals[i].max_rtt_us = 0;
 
 		rocc->intervals[i].ic_rs_prior_mstamp = 0;
@@ -125,12 +126,14 @@ static void rocc_init(struct sock *sk)
 	rocc->last_cwnd = rocc_min_cwnd;
 	rocc->last_to_last_cwnd = rocc_min_cwnd;
 
-	rocc->beliefs.max_c = INIT_MAX_C;
+	rocc->beliefs = (struct belief_data *) kzalloc(sizeof(struct belief_data), GFP_KERNEL);
+	rocc->beliefs->max_c = INIT_MAX_C;
 	// Setting this as U32_MAX and then setting cwnd as U32_MAX causes issues
 	// with the kernel... Earlier set as U32_MAX, even though, max_c is u64,
 	// keeping it at u32_max so that we can multiply and divide by microseconds.
-	rocc->beliefs.min_c = 0;
-	rocc->beliefs.min_qdel = 0;
+	rocc->beliefs->min_c = 0;
+	rocc->beliefs->min_qdel = 0;
+	rocc->beliefs->min_c_lambda = 0;
 
 	rocc->last_timeout_tstamp = 0;
 	rocc->last_timeout_minc = 0;
@@ -177,7 +180,7 @@ static void update_beliefs(struct rocc_data *rocc) {
 	bool cum_utilized;
 
 	struct rocc_interval *this_interval;
-	struct belief_data *beliefs = &rocc->beliefs;
+	struct belief_data *beliefs = rocc->beliefs;
 	u32 rtprop = rocc->min_rtt_us;
 	u32 max_jitter = rtprop;
 
@@ -266,13 +269,13 @@ static void update_beliefs(struct rocc_data *rocc) {
 static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 {
 	struct rocc_data *rocc = inet_csk_ca(sk);
-	struct belief_data *beliefs = &rocc->beliefs;
+	struct belief_data *beliefs = rocc->beliefs;
 	struct tcp_sock *tsk = tcp_sk(sk);
 
 	u16 st;
 	u64 st_tstamp;
 	u16 et = rocc->intervals_head;  // end time
-	u64 et_tstamp = rocc->intervals[et].start_us;
+	// u64 et_tstamp = rocc->intervals[et].start_us;
 
 	struct rocc_interval *this_interval;
 	struct rocc_interval *next_future_interval;
@@ -290,7 +293,7 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 	u32 max_jitter = rtprop;
 	u64 new_min_c_lambda;
 
-	this_interval = = &rocc->intervals[et & rocc_num_intervals_mask];
+	this_interval = &rocc->intervals[et & rocc_num_intervals_mask];
 	this_max_rtt_us = this_interval->max_rtt_us;
 	this_high_delay = this_max_rtt_us > rtprop + max_jitter;
 	this_loss = get_loss_mode(this_interval->pkts_acked, this_interval->pkts_lost);
@@ -321,7 +324,7 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 		// If we saw any utilization signals then we stop updating min_c_lambda
 		if (!cum_under_utilized) break;
 
-		assert (rocc->measurement_interval == 1);
+		BUILD_BUG_ON(rocc_measurement_interval != 1);
 		this_bytes_sent = next_future_interval->ic_bytes_sent - this_interval->ic_bytes_sent;
 		this_interval_length = tcp_stamp_us_delta(next_future_interval->start_us, this_interval->start_us);
 		new_min_c_lambda = this_bytes_sent * U64_S_TO_US / (this_interval_length + max_jitter);
@@ -334,7 +337,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 {
 	struct rocc_data *rocc = inet_csk_ca(sk);
 	struct tcp_sock *tsk = tcp_sk(sk);
-	struct belief_data *beliefs = &rocc->beliefs;
+	struct belief_data *beliefs = rocc->beliefs;
 	u32 rtt_us;
 	u16 i, id;
 	u32 hist_us;
@@ -348,7 +351,8 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	u32 ic_rs_window = 0;
 	u16 nid;
 	s32 delivered_delta = 0;
-	u32 latest_inflight = rs->prior_in_flight; // upper bound on bottleneck queue size.
+	u64 rocc_alpha_rate;
+	u32 latest_inflight_segments = rs->prior_in_flight; // upper bound on bottleneck queue size.
 
 	// printk(KERN_INFO "rocc rate_sample rs_timestamp %llu tcp_timestamp %llu delivered %d", tsk->tcp_mstamp, rs->prior_mstamp);
 	// printk(KERN_INFO "rocc rate_sample acked_sacked %u last_end_seq %u snd_nxt % u rcv_nxt %u", rs->acked_sacked, rs->last_end_seq, tsk->snd_nxt, tsk->rcv_nxt);
@@ -397,6 +401,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		rocc->intervals[rocc->intervals_head].ic_rs_prior_delivered = rs->prior_delivered;
 		rocc->intervals[rocc->intervals_head].processed = false;
 		update_beliefs(rocc);
+		update_beliefs_send(sk, rs);
 	}
 	else {
 		rocc->intervals[rocc->intervals_head].pkts_acked += rs->acked_sacked;
@@ -424,36 +429,41 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	}
 
 	loss_mode = (u64) pkts_lost * 1024 > (u64) (pkts_acked + pkts_lost) * rocc_loss_thresh;
+	rocc_alpha_rate = (rocc_alpha_segments * rocc_get_mss(tsk) * U64_S_TO_US) / rocc->min_rtt_us;
+	if(loss_mode) rocc->state = CONG_AVOID;
 
 	if (tcp_stamp_us_delta(timestamp, rocc->last_update_tstamp) >= rocc->min_rtt_us) {
-		// TODO: Is the update every rtprop time needed, or can we now update
-		// every ACK?
-		/**
-		 * [01/11 08:17:45]  28: if (+ 1min_qdel + -2 > 0):
-		 **		r_f[n][t] = max(alpha, 1/2min_c)           Better delay
-		 *	elif (+ -1min_c + 1/2max_c > 0):
-		 **	elif (+ -3/2min_c + max_c > 0):                Better utilization
-		 *		r_f[n][t] = max(alpha, 2min_c)
-		 **		r_f[n][t] = max(alpha, 3/2min_c)           Better loss
-		 *	else:
-		 *		r_f[n][t] = max(alpha, 1min_c)
-		*/
 
-		if(beliefs->min_qdel > 2 * rocc->min_rtt_us) {
-			sk->sk_pacing_rate = (beliefs->min_c * rocc_get_mss(tsk)) / 2;
+		if(rocc->state == SLOW_START) {
+			sk->sk_pacing_rate = 2 * sk->sk_pacing_rate;
 		}
-		else if(3 * beliefs->min_c > 2 * beliefs->max_c) {
-			sk->sk_pacing_rate = beliefs->min_c * rocc_get_mss(tsk);
-		} else {
-			sk->sk_pacing_rate = (3 * beliefs->min_c * rocc_get_mss(tsk)) / 2;
+		else {
+			if(rocc->state != CONG_AVOID) {
+				printk(KERN_ERR "Invalid state for rocc: %d", rocc->state);
+			}
+			/**
+			 * The 3 is basically R + D + quantization error.
+			 * In the kernel the error is 0. Thus use 2 instead of 3.
+			r_f = max alpha,
+			if (+ 1bq_belief + -1alpha > 0):
+				+ 1alpha
+			else:
+				+ 3min_c_lambda + 1alpha
+			*/
+			if(latest_inflight_segments > 10 * rocc_alpha_segments) { // we are okay losing 10 segments every probe
+				sk->sk_pacing_rate = rocc_alpha_rate;
+			}
+			else {
+				sk->sk_pacing_rate = 2 * beliefs->min_c_lambda * rocc_get_mss(tsk) + rocc_alpha_rate;
+			}
 		}
 
 		// jitter + rtprop = 2 * rocc->min_rtt_us
 		tsk->snd_cwnd = (2 * beliefs->max_c * (2 * rocc->min_rtt_us)) / U64_S_TO_US;
 
 		// lower bound clamps
-		tsk->snd_cwnd = max_t(u32, tsk->snd_cwnd, rocc_alpha);
-		sk->sk_pacing_rate = max_t(u64, sk->sk_pacing_rate, (rocc_alpha * rocc_get_mss(tsk) * U64_S_TO_US) / rocc->min_rtt_us);
+		tsk->snd_cwnd = max_t(u32, tsk->snd_cwnd, rocc_alpha_segments);
+		sk->sk_pacing_rate = max_t(u64, sk->sk_pacing_rate, rocc_alpha_rate);
 
 #ifdef ROCC_DEBUG
 		printk(KERN_INFO
@@ -463,10 +473,10 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 			   tsk->mss_cache, timestamp, rs->interval_us);
 		printk(KERN_INFO
 			   "rocc pkts_acked %u hist_us %u pacing %lu loss_happened %d "
-			   "app_limited %d rs_limited %d",
+			   "app_limited %d rs_limited %d latest_inflight_segments %u",
 			   pkts_acked, hist_us, sk->sk_pacing_rate,
 			   (int)rocc->loss_happened, (int)app_limited,
-			   (int)rs->is_app_limited);
+			   (int)rs->is_app_limited, latest_inflight_segments);
 		printk(KERN_INFO "rocc min_c %llu max_c %llu min_qdel %u",
 			   beliefs->min_c, beliefs->max_c, beliefs->min_qdel);
 		for (i = 0; i < rocc_num_intervals; ++i) {
