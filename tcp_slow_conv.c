@@ -315,8 +315,9 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 
 	for (st = 1; st < rocc_num_intervals; st++) {
 		// This for loop iterates over intervals in descending order of time.
-
 		this_interval = &rocc->intervals[(et + st) & rocc_num_intervals_mask];
+		if (this_interval->invalid) break;
+
 		next_future_interval = &rocc->intervals[(et + st - 1) & rocc_num_intervals_mask];
 		st_tstamp = this_interval->start_us;
 
@@ -518,13 +519,15 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 				   "rocc intervals start_us %llu window %u acked %u lost %u "
 				   "ic_rs_prior_mstamp %llu ic_rs_prior_delivered %u "
 				   "ic_rs_window %u delivered_delta %d "
-				   "app_limited %d i %u id %u",
+				   "app_limited %d min_rtt_us %u max_rtt_us %u "
+				   "i %u id %u",
 				   rocc->intervals[id].start_us, window,
 				   rocc->intervals[id].pkts_acked,
 				   rocc->intervals[id].pkts_lost,
 				   rocc->intervals[id].ic_rs_prior_mstamp,
 				   rocc->intervals[id].ic_rs_prior_delivered, ic_rs_window,
 				   delivered_delta, (int)rocc->intervals[id].app_limited,
+				   rocc->intervals[id].min_rtt_us, rocc->intervals[id].max_rtt_us,
 				   i, id);
 		}
 #endif
