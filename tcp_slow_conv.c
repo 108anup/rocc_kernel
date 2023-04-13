@@ -296,6 +296,7 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 	bool this_high_delay;
 	u32 now_delivered = tsk->delivered;
 	u64 this_bytes_sent;
+	u64 this_min_c_lambda;
 	u64 this_interval_length;
 
 	bool this_under_utilized;
@@ -303,7 +304,7 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 
 	u32 rtprop = rocc->min_rtt_us;
 	u32 max_jitter = rtprop;
-	u64 new_min_c_lambda;
+	u64 new_min_c_lambda = 0;
 
 	this_interval = &rocc->intervals[et & rocc_num_intervals_mask];
 	this_max_rtt_us = this_interval->max_rtt_us;
@@ -339,7 +340,9 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 		BUILD_BUG_ON(rocc_measurement_interval != 1);
 		this_bytes_sent = next_future_interval->ic_bytes_sent - this_interval->ic_bytes_sent;
 		this_interval_length = tcp_stamp_us_delta(next_future_interval->start_us, this_interval->start_us);
-		new_min_c_lambda = this_bytes_sent * U64_S_TO_US / (this_interval_length + max_jitter);
+		this_min_c_lambda = ((this_bytes_sent * U64_S_TO_US) / rocc_get_mss(tsk)) / (this_interval_length + max_jitter);
+		// ^^ We divide by rocc_get_mss(tsk) to convert from bytes to segments or packets.
+		new_min_c_lambda = max_t(u64, new_min_c_lambda, this_min_c_lambda);
 	}
 
 	beliefs->min_c_lambda = max_t(u64, beliefs->min_c_lambda, new_min_c_lambda);
@@ -446,6 +449,8 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	if(loss_mode) rocc->state = CONG_AVOID;
 
 	if (tcp_stamp_us_delta(timestamp, rocc->last_update_tstamp) >= rocc->min_rtt_us) {
+		rocc->last_update_tstamp = timestamp;
+
 		if(rocc->state == SLOW_START) {
 			if(beliefs->min_qdel > rocc->min_rtt_us) {
 				sk->sk_pacing_rate = (beliefs->min_c * rocc_get_mss(tsk)) / 2;
@@ -494,8 +499,8 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 			   pkts_acked, hist_us, sk->sk_pacing_rate,
 			   (int)rocc->loss_happened, (int)app_limited,
 			   (int)rs->is_app_limited, latest_inflight_segments);
-		printk(KERN_INFO "rocc min_c %llu max_c %llu min_qdel %u",
-			   beliefs->min_c, beliefs->max_c, beliefs->min_qdel);
+		printk(KERN_INFO "rocc min_c %llu max_c %llu min_qdel %u min_c_lambda %llu",
+			   beliefs->min_c, beliefs->max_c, beliefs->min_qdel, beliefs->min_c_lambda);
 		for (i = 0; i < rocc_num_intervals; ++i) {
 			id = (rocc->intervals_head + i) & rocc_num_intervals_mask;
 			nid = (id - 1) & rocc_num_intervals_mask;  // next id
