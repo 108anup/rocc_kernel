@@ -23,6 +23,13 @@ static const u32 rocc_history_periods = 8;
 static const u32 rocc_timeout_period = 12;
 static const u32 rocc_significant_mult_percent = 110;
 
+static const u32 rocc_measurement_interval = 1;
+
+enum rocc_state {
+	SLOW_START,
+	CONG_AVOID
+};
+
 // To keep track of the number of packets acked over a short period of time
 struct rocc_interval {
 	// Starting time of this interval
@@ -30,17 +37,22 @@ struct rocc_interval {
 	u32 pkts_acked;
 	u32 pkts_lost;
 	bool app_limited;
-	u32 rtt_us;
+	u32 min_rtt_us;
+	u32 max_rtt_us;
 
 	// metrics at interval creation time
 	u64 ic_rs_prior_mstamp;
 	u32 ic_rs_prior_delivered;
+	u64 ic_bytes_sent;
+
+	bool processed;
 };
 
 struct belief_data {
 	u64 min_c;
 	u64 max_c;
 	u32 min_qdel;
+	u64 min_c_lambda;
 };
 
 static u32 id = 0;
@@ -69,6 +81,8 @@ struct rocc_data {
 	u64 last_timeout_tstamp;
 	u64 last_timeout_minc;
 	u64 last_timeout_maxc;
+
+	enum rocc_state state;
 };
 
 static void rocc_init(struct sock *sk)
@@ -83,9 +97,14 @@ static void rocc_init(struct sock *sk)
 		rocc->intervals[i].pkts_acked = 0;
 		rocc->intervals[i].pkts_lost = 0;
 		rocc->intervals[i].app_limited = false;
+		rocc->intervals[i].min_rtt_us = U64_MAX;
+		rocc->intervals[i].max_rtt_us = 0;
 
 		rocc->intervals[i].ic_rs_prior_mstamp = 0;
 		rocc->intervals[i].ic_rs_prior_delivered = 0;
+		rocc->intervals[i].ic_bytes_sent = 0;
+
+		rocc->intervals[i].processed = false;
 	}
 	rocc->intervals_head = 0;
 
@@ -117,6 +136,8 @@ static void rocc_init(struct sock *sk)
 	rocc->last_timeout_minc = 0;
 	rocc->last_timeout_maxc = INIT_MAX_C;
 
+	rocc->state = SLOW_START;
+
 	cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
 }
 
@@ -143,7 +164,7 @@ static void update_beliefs(struct rocc_data *rocc) {
 	u16 et = rocc->intervals_head;  // end time
 	u64 et_tstamp = rocc->intervals[et].start_us;
 
-	u32 this_rtt_us;
+	u32 this_min_rtt_us;
 
 	u64 st_tstamp;
 	u32 cum_pkts_acked = 0;
@@ -167,16 +188,16 @@ static void update_beliefs(struct rocc_data *rocc) {
 	u32 time_since_last_timeout = tcp_stamp_us_delta(now, rocc->last_timeout_tstamp);
 	bool timeout = time_since_last_timeout > rocc_timeout_period * rocc->min_rtt_us;
 
-	// The et interval might have just started with very few measurements. So we
-	// ignore measurements in that interval... We can perhaps keep a tstamp of
-	// the last measurement in that interval?
+	// The et interval might have just started with very few measurements. So
+	// we ignore measurements in that interval (start st at 1 instead of 0). We
+	// can perhaps keep a tstamp of the last measurement in that interval?
 	for (st = 1; st < rocc_num_intervals; st++) {
 		this_interval = &rocc->intervals[(et + st) & rocc_num_intervals_mask];
-		this_rtt_us = this_interval->rtt_us;
+		this_min_rtt_us = this_interval->min_rtt_us;
 		st_tstamp = this_interval->start_us;
 		window = tcp_stamp_us_delta(et_tstamp, st_tstamp);
 
-		this_high_delay = this_rtt_us > rtprop + max_jitter;
+		this_high_delay = this_min_rtt_us > rtprop + max_jitter;
 		this_loss = get_loss_mode(this_interval->pkts_acked, this_interval->pkts_lost);
 		// TODO: loss was detected in this interval does not mean this interval
 		// was utilized. Things were utilized when pkt with sequence number just
@@ -189,8 +210,8 @@ static void update_beliefs(struct rocc_data *rocc) {
 		}
 
 		// UPDATE QDEL BELIEFS
-		if(this_rtt_us > rtprop + max_jitter) {
-			beliefs->min_qdel = this_rtt_us - rtprop - max_jitter;
+		if(this_min_rtt_us > rtprop + max_jitter) {
+			beliefs->min_qdel = this_min_rtt_us - rtprop - max_jitter;
 		}
 
 		// UPDATE LINK RATE BELIEFS
@@ -207,7 +228,6 @@ static void update_beliefs(struct rocc_data *rocc) {
 			new_max_c =
 				min_t(u64, new_max_c, (U64_S_TO_US * cum_pkts_acked) / (window - max_jitter));
 		}
-
 	}
 
 	if(timeout) {
@@ -243,6 +263,73 @@ static void update_beliefs(struct rocc_data *rocc) {
 	}
 }
 
+static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
+{
+	struct rocc_data *rocc = inet_csk_ca(sk);
+	struct belief_data *beliefs = &rocc->beliefs;
+	struct tcp_sock *tsk = tcp_sk(sk);
+
+	u16 st;
+	u64 st_tstamp;
+	u16 et = rocc->intervals_head;  // end time
+	u64 et_tstamp = rocc->intervals[et].start_us;
+
+	struct rocc_interval *this_interval;
+	struct rocc_interval *next_future_interval;
+	u64 this_max_rtt_us;
+	bool this_loss;
+	bool this_high_delay;
+	u32 now_delivered = tsk->delivered;
+	u64 this_bytes_sent;
+	u64 this_interval_length;
+
+	bool this_under_utilized;
+	bool cum_under_utilized = true;
+
+	u32 rtprop = rocc->min_rtt_us;
+	u32 max_jitter = rtprop;
+	u64 new_min_c_lambda;
+
+	this_interval = = &rocc->intervals[et & rocc_num_intervals_mask];
+	this_max_rtt_us = this_interval->max_rtt_us;
+	this_high_delay = this_max_rtt_us > rtprop + max_jitter;
+	this_loss = get_loss_mode(this_interval->pkts_acked, this_interval->pkts_lost);
+	this_under_utilized = !this_loss && !this_high_delay;
+	cum_under_utilized = cum_under_utilized && this_under_utilized;
+
+	for (st = 1; st < rocc_num_intervals; st++) {
+		// This for loop iterates over intervals in descending order of time.
+
+		this_interval = &rocc->intervals[(et + st) & rocc_num_intervals_mask];
+		next_future_interval = &rocc->intervals[(et + st - 1) & rocc_num_intervals_mask];
+		st_tstamp = this_interval->start_us;
+
+		// We only consider this interval if all packets sent were 1 RTT before
+		// now.
+		if (next_future_interval->ic_bytes_sent > now_delivered) continue;
+
+		// Stop if we have already considered this and past intervals.
+		if (this_interval->processed) break;
+		this_interval->processed = true;
+
+		this_max_rtt_us = this_interval->max_rtt_us;
+		this_high_delay = this_max_rtt_us > rtprop + max_jitter;
+		this_loss = get_loss_mode(this_interval->pkts_acked, this_interval->pkts_lost);
+		this_under_utilized = !this_loss && !this_high_delay;
+		cum_under_utilized = cum_under_utilized && this_under_utilized;
+
+		// If we saw any utilization signals then we stop updating min_c_lambda
+		if (!cum_under_utilized) break;
+
+		assert (rocc->measurement_interval == 1);
+		this_bytes_sent = next_future_interval->ic_bytes_sent - this_interval->ic_bytes_sent;
+		this_interval_length = tcp_stamp_us_delta(next_future_interval->start_us, this_interval->start_us);
+		new_min_c_lambda = this_bytes_sent * U64_S_TO_US / (this_interval_length + max_jitter);
+	}
+
+	beliefs->min_c_lambda = max_t(u64, beliefs->min_c_lambda, new_min_c_lambda);
+}
+
 static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 {
 	struct rocc_data *rocc = inet_csk_ca(sk);
@@ -261,6 +348,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	u32 ic_rs_window = 0;
 	u16 nid;
 	s32 delivered_delta = 0;
+	u32 latest_inflight = rs->prior_in_flight; // upper bound on bottleneck queue size.
 
 	// printk(KERN_INFO "rocc rate_sample rs_timestamp %llu tcp_timestamp %llu delivered %d", tsk->tcp_mstamp, rs->prior_mstamp);
 	// printk(KERN_INFO "rocc rate_sample acked_sacked %u last_end_seq %u snd_nxt % u rcv_nxt %u", rs->acked_sacked, rs->last_end_seq, tsk->snd_nxt, tsk->rcv_nxt);
@@ -302,9 +390,12 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		rocc->intervals[rocc->intervals_head].pkts_acked = rs->acked_sacked;
 		rocc->intervals[rocc->intervals_head].pkts_lost = rs->losses;
 		rocc->intervals[rocc->intervals_head].app_limited = rs->is_app_limited;
-		rocc->intervals[rocc->intervals_head].rtt_us = rs->rtt_us;
+		rocc->intervals[rocc->intervals_head].min_rtt_us = rs->rtt_us;
+		rocc->intervals[rocc->intervals_head].max_rtt_us = rs->rtt_us;
+		rocc->intervals[rocc->intervals_head].ic_bytes_sent = tsk->bytes_sent;
 		rocc->intervals[rocc->intervals_head].ic_rs_prior_mstamp = rs->prior_mstamp;
 		rocc->intervals[rocc->intervals_head].ic_rs_prior_delivered = rs->prior_delivered;
+		rocc->intervals[rocc->intervals_head].processed = false;
 		update_beliefs(rocc);
 	}
 	else {
@@ -312,8 +403,10 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		rocc->intervals[rocc->intervals_head].pkts_lost += rs->losses;
 		rocc->intervals[rocc->intervals_head].app_limited |= rs->is_app_limited;
 		// TODO: check what kind of aggregation we want here.
-		rocc->intervals[rocc->intervals_head].rtt_us =
-			min_t(u32, (u32) rs->rtt_us, rocc->intervals[rocc->intervals_head].rtt_us);
+		rocc->intervals[rocc->intervals_head].min_rtt_us =
+			min_t(u32, (u32) rs->rtt_us, rocc->intervals[rocc->intervals_head].min_rtt_us);
+		rocc->intervals[rocc->intervals_head].max_rtt_us =
+			max_t(u32, (u32) rs->rtt_us, rocc->intervals[rocc->intervals_head].max_rtt_us);
 	}
 
 	// Find the statistics from the last `hist` seconds
