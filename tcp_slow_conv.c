@@ -225,7 +225,8 @@ static void update_beliefs(struct sock *sk) {
 		// UPDATE QDEL BELIEFS
 		if(this_min_rtt_us > rtprop + max_jitter) {
 			beliefs->min_qdel = this_min_rtt_us - (rtprop + max_jitter);
-		} else {
+		}
+		else {
 			beliefs->min_qdel = 0;
 		}
 
@@ -531,7 +532,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 				   rocc->intervals[id].ic_rs_prior_delivered, ic_rs_window,
 				   delivered_delta, (int)rocc->intervals[id].app_limited,
 				   rocc->intervals[id].min_rtt_us, rocc->intervals[id].max_rtt_us,
-				   i, id, rocc->intervals[id].valid, rocc->intervals[id].processed);
+				   i, id, rocc->intervals[id].invalid, rocc->intervals[id].processed);
 		}
 #endif
 	}
