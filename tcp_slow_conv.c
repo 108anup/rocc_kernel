@@ -316,6 +316,8 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 	this_under_utilized = !this_loss && !this_high_delay;
 	cum_under_utilized = cum_under_utilized && this_under_utilized;
 
+	// printk(KERN_INFO "update beliefs send begin min_c_lambda %llu", beliefs->min_c_lambda);
+
 	for (st = 1; st < rocc_num_intervals; st++) {
 		// This for loop iterates over intervals in descending order of time.
 		this_interval = &rocc->intervals[(et + st) & rocc_num_intervals_mask];
@@ -324,6 +326,12 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 		next_future_interval = &rocc->intervals[(et + st - 1) & rocc_num_intervals_mask];
 		st_tstamp = this_interval->start_us;
 
+		this_max_rtt_us = this_interval->max_rtt_us;
+		this_high_delay = this_max_rtt_us > rtprop + max_jitter;
+		this_loss = get_loss_mode(this_interval->pkts_acked, this_interval->pkts_lost);
+		this_under_utilized = !this_loss && !this_high_delay;
+		cum_under_utilized = cum_under_utilized && this_under_utilized;
+
 		// We only consider this interval if all packets sent were 1 RTT before
 		// now.
 		if (next_future_interval->ic_bytes_sent > now_bytes_delivered) continue;
@@ -331,12 +339,6 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 		// Stop if we have already considered this and past intervals.
 		if (this_interval->processed) break;
 		this_interval->processed = true;
-
-		this_max_rtt_us = this_interval->max_rtt_us;
-		this_high_delay = this_max_rtt_us > rtprop + max_jitter;
-		this_loss = get_loss_mode(this_interval->pkts_acked, this_interval->pkts_lost);
-		this_under_utilized = !this_loss && !this_high_delay;
-		cum_under_utilized = cum_under_utilized && this_under_utilized;
 
 		// If we saw any utilization signals then we stop updating min_c_lambda
 		if (!cum_under_utilized) break;
@@ -362,9 +364,6 @@ void print_beliefs(struct sock *sk){
 	u32 ic_rs_window = 0;
 	s32 delivered_delta = 0;
 	s32 sent_delta_pkts = 0;
-
-	bool this_under_utilized;
-	bool cum_under_utilized = true;
 
 	printk(KERN_INFO "rocc min_c %llu max_c %llu min_qdel %u min_c_lambda %llu",
 		   beliefs->min_c, beliefs->max_c, beliefs->min_qdel,
