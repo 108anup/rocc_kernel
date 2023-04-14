@@ -352,6 +352,57 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 	beliefs->min_c_lambda = max_t(u64, beliefs->min_c_lambda, new_min_c_lambda);
 }
 
+void print_beliefs(struct sock *sk){
+	struct rocc_data *rocc = inet_csk_ca(sk);
+	struct belief_data *beliefs = rocc->beliefs;
+	struct tcp_sock *tsk = tcp_sk(sk);
+
+	u16 i, id, nid;
+	u32 window = 0;
+	u32 ic_rs_window = 0;
+	s32 delivered_delta = 0;
+	s32 sent_delta_pkts = 0;
+
+	bool this_under_utilized;
+	bool cum_under_utilized = true;
+
+	printk(KERN_INFO "rocc min_c %llu max_c %llu min_qdel %u min_c_lambda %llu",
+		   beliefs->min_c, beliefs->max_c, beliefs->min_qdel,
+		   beliefs->min_c_lambda);
+	for (i = 0; i < rocc_num_intervals; ++i) {
+		id = (rocc->intervals_head + i) & rocc_num_intervals_mask;
+		nid = (id - 1) & rocc_num_intervals_mask;  // next id
+		if (i >= 1) {
+			window = tcp_stamp_us_delta(rocc->intervals[nid].start_us,
+										rocc->intervals[id].start_us);
+			ic_rs_window =
+				tcp_stamp_us_delta(rocc->intervals[nid].ic_rs_prior_mstamp,
+								   rocc->intervals[id].ic_rs_prior_mstamp);
+			delivered_delta = (rocc->intervals[nid].ic_rs_prior_delivered -
+							   rocc->intervals[id].ic_rs_prior_delivered);
+			sent_delta_pkts = (((s64)rocc->intervals[nid].ic_bytes_sent) -
+							   rocc->intervals[id].ic_bytes_sent) /
+							  rocc_get_mss(tsk);
+		}
+		printk(KERN_INFO
+			   "rocc intervals start_us %llu window %u acked %u lost %u "
+			   "ic_rs_prior_mstamp %llu ic_rs_prior_delivered %u "
+			   "ic_rs_window %u delivered_delta %d "
+			   "app_limited %d min_rtt_us %u max_rtt_us %u "
+			   "i %u id %u invalid %d processed %d "
+			   "ic_bytes_sent %llu sent_delta_pkts %d",
+			   rocc->intervals[id].start_us, window,
+			   rocc->intervals[id].pkts_acked, rocc->intervals[id].pkts_lost,
+			   rocc->intervals[id].ic_rs_prior_mstamp,
+			   rocc->intervals[id].ic_rs_prior_delivered, ic_rs_window,
+			   delivered_delta, (int)rocc->intervals[id].app_limited,
+			   rocc->intervals[id].min_rtt_us, rocc->intervals[id].max_rtt_us,
+			   i, id, rocc->intervals[id].invalid,
+			   rocc->intervals[id].processed, rocc->intervals[id].ic_bytes_sent,
+			   sent_delta_pkts);
+	}
+}
+
 static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 {
 	struct rocc_data *rocc = inet_csk_ca(sk);
@@ -366,10 +417,6 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	u32 pkts_acked, pkts_lost;
 	bool loss_mode, app_limited;
 
-	u32 window = 0;
-	u32 ic_rs_window = 0;
-	u16 nid;
-	s32 delivered_delta = 0;
 	u64 rocc_alpha_rate;
 	u32 latest_inflight_segments = rs->prior_in_flight; // upper bound on bottleneck queue size.
 
@@ -422,6 +469,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		rocc->intervals[rocc->intervals_head].invalid = false;
 		update_beliefs(sk);
 		update_beliefs_send(sk, rs);
+		print_beliefs(sk);
 	}
 	else {
 		rocc->intervals[rocc->intervals_head].pkts_acked += rs->acked_sacked;
@@ -506,38 +554,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 			   (int)rocc->loss_happened, (int)app_limited,
 			   (int)rs->is_app_limited, latest_inflight_segments,
 			   ((u64) rocc_get_mss(tsk)) * tsk->delivered);
-		printk(KERN_INFO "rocc min_c %llu max_c %llu min_qdel %u min_c_lambda %llu",
-			   beliefs->min_c, beliefs->max_c, beliefs->min_qdel, beliefs->min_c_lambda);
-		for (i = 0; i < rocc_num_intervals; ++i) {
-			id = (rocc->intervals_head + i) & rocc_num_intervals_mask;
-			nid = (id - 1) & rocc_num_intervals_mask;  // next id
-			if (i >= 1) {
-				window = tcp_stamp_us_delta(rocc->intervals[nid].start_us,
-											rocc->intervals[id].start_us);
-				ic_rs_window =
-					tcp_stamp_us_delta(rocc->intervals[nid].ic_rs_prior_mstamp,
-									   rocc->intervals[id].ic_rs_prior_mstamp);
-				delivered_delta =
-					(rocc->intervals[nid].ic_rs_prior_delivered -
-					 rocc->intervals[id].ic_rs_prior_delivered);
-			}
-			printk(KERN_INFO
-				   "rocc intervals start_us %llu window %u acked %u lost %u "
-				   "ic_rs_prior_mstamp %llu ic_rs_prior_delivered %u "
-				   "ic_rs_window %u delivered_delta %d "
-				   "app_limited %d min_rtt_us %u max_rtt_us %u "
-				   "i %u id %u invalid %d processed %d "
-				   "ic_bytes_sent %llu",
-				   rocc->intervals[id].start_us, window,
-				   rocc->intervals[id].pkts_acked,
-				   rocc->intervals[id].pkts_lost,
-				   rocc->intervals[id].ic_rs_prior_mstamp,
-				   rocc->intervals[id].ic_rs_prior_delivered, ic_rs_window,
-				   delivered_delta, (int)rocc->intervals[id].app_limited,
-				   rocc->intervals[id].min_rtt_us, rocc->intervals[id].max_rtt_us,
-				   i, id, rocc->intervals[id].invalid, rocc->intervals[id].processed,
-				   rocc->intervals[id].ic_bytes_sent);
-		}
+		// print_beliefs(sk);
 #endif
 	}
 	// printk(KERN_INFO "rocc_process_sample got rtt_us %lu", rs->rtt_us);
