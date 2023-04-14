@@ -5,8 +5,8 @@
 
 #define ROCC_DEBUG
 #define U64_S_TO_US ((u64) 1e6)
-#define INIT_MAX_C ((u32) 1e7)
-// ^^ This is roughly 120 Gbps.
+#define INIT_MAX_C ((u32) 1e5)
+// ^^ This is roughly 1.20 Gbps.
 
 // Should be a power of two so rocc_num_intervals_mask can be set
 static const u16 rocc_num_intervals = 16;
