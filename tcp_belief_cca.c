@@ -5,6 +5,8 @@
 
 #define ROCC_DEBUG
 #define U64_S_TO_US ((u64) 1e6)
+#define INIT_MAX_C ((u32) 1e5)
+// ^^ This is roughly 1.20 Gbps.
 
 // Should be a power of two so rocc_num_intervals_mask can be set
 static const u16 rocc_num_intervals = 16;
@@ -98,7 +100,7 @@ static void rocc_init(struct sock *sk)
 	rocc->last_cwnd = rocc_min_cwnd;
 	rocc->last_to_last_cwnd = rocc_min_cwnd;
 
-	rocc->beliefs.max_c = (u32) 1e7; // This is roughly 120 Gbps.
+	rocc->beliefs.max_c = INIT_MAX_C;
 	// Setting this as U32_MAX and then setting cwnd as U32_MAX causes issues
 	// with the kernel... Earlier set as U32_MAX, even though, max_c is u64,
 	// keeping it at u32_max so that we can multiply and divide by microseconds.
