@@ -15,7 +15,7 @@ static const u16 rocc_num_intervals = 16;
 // rocc_num_intervals-1
 static const u16 rocc_num_intervals_mask = 15;
 static const u32 rocc_min_cwnd = 2;
-static const u32 rocc_alpha_segments = 1;
+static const u32 rocc_alpha_segments = 5;
 // Maximum tolerable loss rate, expressed as `loss_thresh / 1024`. Calculations
 // are faster if things are powers of 2
 static const u64 rocc_loss_thresh = 64;
@@ -225,6 +225,8 @@ static void update_beliefs(struct sock *sk) {
 		// UPDATE QDEL BELIEFS
 		if(this_min_rtt_us > rtprop + max_jitter) {
 			beliefs->min_qdel = this_min_rtt_us - (rtprop + max_jitter);
+		} else {
+			beliefs->min_qdel = 0;
 		}
 
 		// UPDATE LINK RATE BELIEFS
@@ -473,7 +475,8 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 			else:
 				+ 3min_c_lambda + 1alpha
 			*/
-			if(latest_inflight_segments > 10 * rocc_alpha_segments) { // we are okay losing 10 segments every probe
+			if(latest_inflight_segments > 10 * rocc_alpha_segments) {
+				// ^^ we are okay losing 10 alpha segments every probe
 				sk->sk_pacing_rate = rocc_alpha_rate;
 			}
 			else {
@@ -520,7 +523,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 				   "ic_rs_prior_mstamp %llu ic_rs_prior_delivered %u "
 				   "ic_rs_window %u delivered_delta %d "
 				   "app_limited %d min_rtt_us %u max_rtt_us %u "
-				   "i %u id %u",
+				   "i %u id %u valid %d processed %d",
 				   rocc->intervals[id].start_us, window,
 				   rocc->intervals[id].pkts_acked,
 				   rocc->intervals[id].pkts_lost,
@@ -528,7 +531,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 				   rocc->intervals[id].ic_rs_prior_delivered, ic_rs_window,
 				   delivered_delta, (int)rocc->intervals[id].app_limited,
 				   rocc->intervals[id].min_rtt_us, rocc->intervals[id].max_rtt_us,
-				   i, id);
+				   i, id, rocc->intervals[id].valid, rocc->intervals[id].processed);
 		}
 #endif
 	}
