@@ -503,7 +503,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		rocc->last_update_tstamp = timestamp;
 
 		if(rocc->state == SLOW_START) {
-			if(beliefs->min_qdel > rocc->min_rtt_us) {
+			if(beliefs->min_qdel > 0) {
 				sk->sk_pacing_rate = (beliefs->min_c * rocc_get_mss(tsk)) / 2;
 			}
 			else {
