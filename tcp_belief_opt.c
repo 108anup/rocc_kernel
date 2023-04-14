@@ -192,6 +192,9 @@ static void update_beliefs(struct rocc_data *rocc) {
 		if(this_rtt_us > rtprop + max_jitter) {
 			beliefs->min_qdel = this_rtt_us - rtprop - max_jitter;
 		}
+		else {
+			beliefs->min_qdel = 0;
+		}
 
 		// UPDATE LINK RATE BELIEFS
 		cum_pkts_acked += this_interval->pkts_acked;
