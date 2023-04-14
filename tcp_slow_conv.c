@@ -297,7 +297,7 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 	u64 this_max_rtt_us;
 	bool this_loss;
 	bool this_high_delay;
-	u32 now_delivered = tsk->delivered;
+	u64 now_bytes_delivered = ((u64) rocc_get_mss(tsk)) * tsk->delivered;
 	u64 this_bytes_sent;
 	u64 this_min_c_lambda;
 	u64 this_interval_length;
@@ -326,7 +326,7 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 
 		// We only consider this interval if all packets sent were 1 RTT before
 		// now.
-		if (next_future_interval->ic_bytes_sent > now_delivered) continue;
+		if (next_future_interval->ic_bytes_sent > now_bytes_delivered) continue;
 
 		// Stop if we have already considered this and past intervals.
 		if (this_interval->processed) break;
@@ -500,10 +500,12 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 			   tsk->mss_cache, timestamp, rs->interval_us, rocc->state);
 		printk(KERN_INFO
 			   "rocc pkts_acked %u hist_us %u pacing %lu loss_happened %d "
-			   "app_limited %d rs_limited %d latest_inflight_segments %u",
+			   "app_limited %d rs_limited %d latest_inflight_segments %u "
+			   "delivered_bytes %llu",
 			   pkts_acked, hist_us, sk->sk_pacing_rate,
 			   (int)rocc->loss_happened, (int)app_limited,
-			   (int)rs->is_app_limited, latest_inflight_segments);
+			   (int)rs->is_app_limited, latest_inflight_segments,
+			   ((u64) rocc_get_mss(tsk)) * tsk->delivered);
 		printk(KERN_INFO "rocc min_c %llu max_c %llu min_qdel %u min_c_lambda %llu",
 			   beliefs->min_c, beliefs->max_c, beliefs->min_qdel, beliefs->min_c_lambda);
 		for (i = 0; i < rocc_num_intervals; ++i) {
@@ -524,7 +526,8 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 				   "ic_rs_prior_mstamp %llu ic_rs_prior_delivered %u "
 				   "ic_rs_window %u delivered_delta %d "
 				   "app_limited %d min_rtt_us %u max_rtt_us %u "
-				   "i %u id %u valid %d processed %d",
+				   "i %u id %u invalid %d processed %d "
+				   "ic_bytes_sent %llu",
 				   rocc->intervals[id].start_us, window,
 				   rocc->intervals[id].pkts_acked,
 				   rocc->intervals[id].pkts_lost,
@@ -532,7 +535,8 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 				   rocc->intervals[id].ic_rs_prior_delivered, ic_rs_window,
 				   delivered_delta, (int)rocc->intervals[id].app_limited,
 				   rocc->intervals[id].min_rtt_us, rocc->intervals[id].max_rtt_us,
-				   i, id, rocc->intervals[id].invalid, rocc->intervals[id].processed);
+				   i, id, rocc->intervals[id].invalid, rocc->intervals[id].processed,
+				   rocc->intervals[id].ic_bytes_sent);
 		}
 #endif
 	}
