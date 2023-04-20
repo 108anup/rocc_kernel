@@ -199,6 +199,17 @@ static void update_beliefs(struct sock *sk) {
 	u32 time_since_last_timeout = tcp_stamp_us_delta(now, rocc->last_timeout_tstamp);
 	bool timeout = time_since_last_timeout > rocc_timeout_period * rocc->min_rtt_us;
 
+	// UPDATE QDEL BELIEFS
+	this_interval = &rocc->intervals[et & rocc_num_intervals_mask];
+	this_min_rtt_us = this_interval->min_rtt_us;
+	if(this_min_rtt_us > rtprop + max_jitter && !(this_interval->invalid)) {
+		beliefs->min_qdel = this_min_rtt_us - (rtprop + max_jitter);
+	}
+	else {
+		beliefs->min_qdel = 0;
+	}
+
+	// UPDATE LINK RATE BELIEFS
 	// The et interval might have just started with very few measurements. So
 	// we ignore measurements in that interval (start st at 1 instead of 0). We
 	// can perhaps keep a tstamp of the last measurement in that interval?
@@ -222,15 +233,6 @@ static void update_beliefs(struct sock *sk) {
 			cum_utilized = cum_utilized && this_utilized;
 		}
 
-		// UPDATE QDEL BELIEFS
-		if(this_min_rtt_us > rtprop + max_jitter) {
-			beliefs->min_qdel = this_min_rtt_us - (rtprop + max_jitter);
-		}
-		else {
-			beliefs->min_qdel = 0;
-		}
-
-		// UPDATE LINK RATE BELIEFS
 		cum_pkts_acked += this_interval->pkts_acked;
 		// cum_ack_rate =
 		// 	U64_S_TO_US * cum_pkts_acked / window;
