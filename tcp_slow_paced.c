@@ -24,11 +24,12 @@ static const u32 rocc_history_periods = 8;
 static const u32 rocc_timeout_period = 12;
 static const u32 rocc_significant_mult_percent = 110;
 
-static const u32 rocc_measurement_interval = 1;
+static const u32 rocc_measurement_interval = 8;
 
 enum rocc_state {
 	SLOW_START,
-	CONG_AVOID
+	PROBE,
+	DRAIN
 };
 
 // To keep track of the number of packets acked over a short period of time
@@ -85,6 +86,7 @@ struct rocc_data {
 	u64 last_timeout_maxc;
 
 	enum rocc_state state;
+	u16 state_probe_count;
 };
 
 static void rocc_init(struct sock *sk)
@@ -142,6 +144,7 @@ static void rocc_init(struct sock *sk)
 	rocc->last_timeout_maxc = INIT_MAX_C;
 
 	rocc->state = SLOW_START;
+	rocc->state_probe_count = 0;
 
 	cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
 	// printk(KERN_INFO "ROCC: Initialized ROCC with max_c %llu", rocc->beliefs->max_c);
@@ -290,7 +293,7 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 	struct tcp_sock *tsk = tcp_sk(sk);
 
 	u16 st;
-	u64 st_tstamp;
+	// u64 st_tstamp;
 	u16 et = rocc->intervals_head;  // end time
 	// u64 et_tstamp = rocc->intervals[et].start_us;
 
@@ -325,8 +328,6 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 		this_interval = &rocc->intervals[(et + st) & rocc_num_intervals_mask];
 		if (this_interval->invalid) break;
 
-		next_future_interval = &rocc->intervals[(et + st - 1) & rocc_num_intervals_mask];
-		st_tstamp = this_interval->start_us;
 
 		this_max_rtt_us = this_interval->max_rtt_us;
 		this_high_delay = this_max_rtt_us > rtprop + max_jitter;
@@ -334,6 +335,10 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 		this_under_utilized = !this_loss && !this_high_delay;
 		cum_under_utilized = cum_under_utilized && this_under_utilized;
 
+		if (st < rocc_measurement_interval) continue;
+		next_future_interval =
+			&rocc->intervals[(et + st - rocc_measurement_interval) &
+							 rocc_num_intervals_mask];
 		// We only consider this interval if all packets sent were 1 RTT before
 		// now.
 		if (next_future_interval->ic_bytes_sent > now_bytes_delivered) continue;
@@ -345,7 +350,7 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 		// If we saw any utilization signals then we stop updating min_c_lambda
 		if (!cum_under_utilized) break;
 
-		BUILD_BUG_ON(rocc_measurement_interval != 1);
+		// BUILD_BUG_ON(rocc_measurement_interval != 1);
 		this_bytes_sent = next_future_interval->ic_bytes_sent - this_interval->ic_bytes_sent;
 		this_interval_length = tcp_stamp_us_delta(next_future_interval->start_us, this_interval->start_us);
 		this_min_c_lambda = ((this_bytes_sent * U64_S_TO_US) / rocc_get_mss(tsk)) / (this_interval_length + max_jitter);
@@ -499,10 +504,21 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 
 	loss_mode = (u64) pkts_lost * 1024 > (u64) (pkts_acked + pkts_lost) * rocc_loss_thresh;
 	rocc_alpha_rate = (rocc_alpha_segments * rocc_get_mss(tsk) * U64_S_TO_US) / rocc->min_rtt_us;
-	if(loss_mode) rocc->state = CONG_AVOID;
+	if(loss_mode) rocc->state = DRAIN;
 
 	if (tcp_stamp_us_delta(timestamp, rocc->last_update_tstamp) >= rocc->min_rtt_us) {
 		rocc->last_update_tstamp = timestamp;
+
+		// We are stretching the drain period to rocc_measurement_interval long.
+		/**
+		 * The 3 is basically R + D + quantization error.
+		 * In the kernel the error is 0. Thus use 2 instead of 3.
+		r_f = max alpha,
+		if (+ 1bq_belief + -1alpha > 0):
+			+ 1alpha
+		else:
+			+ 3min_c_lambda + 1alpha
+		*/
 
 		if(rocc->state == SLOW_START) {
 			if(beliefs->min_qdel > 0) {
@@ -512,25 +528,35 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 				sk->sk_pacing_rate = 2 * beliefs->min_c * rocc_get_mss(tsk);
 			}
 		}
-		else {
-			if(rocc->state != CONG_AVOID) {
-				printk(KERN_ERR "Invalid state for rocc: %d", rocc->state);
-			}
-			/**
-			 * The 3 is basically R + D + quantization error.
-			 * In the kernel the error is 0. Thus use 2 instead of 3.
-			r_f = max alpha,
-			if (+ 1bq_belief + -1alpha > 0):
-				+ 1alpha
-			else:
-				+ 3min_c_lambda + 1alpha
-			*/
+
+		else if(rocc->state == DRAIN) {
 			if(latest_inflight_segments > 10 * rocc_alpha_segments) {
 				// ^^ we are okay losing 10 alpha segments every probe
 				sk->sk_pacing_rate = rocc_alpha_rate;
+			} else {
+				rocc->state = PROBE;
+				rocc->state_probe_count = 1;
+				sk->sk_pacing_rate =
+					((1 + rocc_measurement_interval) * beliefs->min_c_lambda *
+					 rocc_get_mss(tsk)) /
+						rocc_measurement_interval +
+					rocc_alpha_rate;
 			}
-			else {
-				sk->sk_pacing_rate = 2 * beliefs->min_c_lambda * rocc_get_mss(tsk) + rocc_alpha_rate;
+		}
+
+		else {
+			if(rocc->state != PROBE) {
+				printk(KERN_ERR "Invalid state for rocc: %d", rocc->state);
+			}
+			rocc->state_probe_count++;
+			sk->sk_pacing_rate =
+				((1 + rocc_measurement_interval) * beliefs->min_c_lambda *
+					rocc_get_mss(tsk)) /
+					rocc_measurement_interval +
+				rocc_alpha_rate;
+			if(rocc->state_probe_count == rocc_measurement_interval) {
+				rocc->state = DRAIN;
+				rocc->state_probe_count = 0;
 			}
 		}
 
@@ -544,9 +570,10 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 #ifdef ROCC_DEBUG
 		printk(KERN_INFO
 			   "rocc flow %u cwnd %u pacing %lu rtt %u mss %u timestamp %llu "
-			   "interval %ld state %d",
+			   "interval %ld state %d state_probe_count %u",
 			   rocc->id, tsk->snd_cwnd, sk->sk_pacing_rate, rtt_us,
-			   tsk->mss_cache, timestamp, rs->interval_us, rocc->state);
+			   tsk->mss_cache, timestamp, rs->interval_us, rocc->state,
+			   rocc->state_probe_count);
 		printk(KERN_INFO
 			   "rocc pkts_acked %u hist_us %u pacing %lu loss_happened %d "
 			   "app_limited %d rs_limited %d latest_inflight_segments %u "
