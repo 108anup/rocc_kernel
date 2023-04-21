@@ -314,9 +314,9 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 
 #ifdef ROCC_DEBUG
 		printk(KERN_INFO
-			   "rocc flow %u cwnd %u pacing %lu rtt %u mss %u timestamp %llu "
-			   "interval %ld",
-			   rocc->id, tsk->snd_cwnd, sk->sk_pacing_rate, rtt_us,
+			   "rocc flow %u cwnd %u pacing %lu min_rtt_us %u "
+			   "rtt %u mss %u timestamp %llu interval %ld",
+			   rocc->id, tsk->snd_cwnd, sk->sk_pacing_rate, rocc->min_rtt_us, rtt_us,
 			   tsk->mss_cache, timestamp, rs->interval_us);
 		printk(KERN_INFO
 			   "rocc pkts_acked %u hist_us %u pacing %lu loss_happened %d "
@@ -343,13 +343,15 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 				   "rocc intervals start_us %llu window %u acked %u lost %u "
 				   "ic_rs_prior_mstamp %llu ic_rs_prior_delivered %u "
 				   "ic_rs_window %u delivered_delta %d "
-				   "app_limited %d i %u id %u",
+				   "app_limited %d min_rtt_us %u "
+				   "i %u id %u",
 				   rocc->intervals[id].start_us, window,
 				   rocc->intervals[id].pkts_acked,
 				   rocc->intervals[id].pkts_lost,
 				   rocc->intervals[id].ic_rs_prior_mstamp,
 				   rocc->intervals[id].ic_rs_prior_delivered, ic_rs_window,
 				   delivered_delta, (int)rocc->intervals[id].app_limited,
+				   rocc->intervals[id].min_rtt_us,
 				   i, id);
 		}
 #endif
