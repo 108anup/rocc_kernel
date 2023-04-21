@@ -138,7 +138,10 @@ static bool get_loss_mode(u32 pkts_acked, u32 pkts_lost) {
 	return loss_mode;
 }
 
-static void update_beliefs(struct rocc_data *rocc) {
+static void update_beliefs(struct sock *sk) {
+	struct tcp_sock *tsk = tcp_sk(sk);
+	struct rocc_data *rocc = inet_csk_ca(sk);
+
 	u16 st;
 	u16 et = rocc->intervals_head;  // end time
 	u64 et_tstamp = rocc->intervals[et].start_us;
@@ -162,6 +165,8 @@ static void update_beliefs(struct rocc_data *rocc) {
 
 	u64 new_min_c = 0;
 	u64 new_max_c = INIT_MAX_C;
+	u64 rocc_alpha_rate = (rocc_alpha_segments * rocc_get_mss(tsk) * U64_S_TO_US) / rocc->min_rtt_us;
+	u64 max_c_lower_clamp = max_t(u64, 2, rocc_alpha_rate);
 
 	u64 now = et_tstamp;
 	u32 time_since_last_timeout = tcp_stamp_us_delta(now, rocc->last_timeout_tstamp);
@@ -312,7 +317,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		rocc->intervals[rocc->intervals_head].min_rtt_us = rs->rtt_us;
 		rocc->intervals[rocc->intervals_head].ic_rs_prior_mstamp = rs->prior_mstamp;
 		rocc->intervals[rocc->intervals_head].ic_rs_prior_delivered = rs->prior_delivered;
-		update_beliefs(rocc);
+		update_beliefs(sk);
 	}
 	else {
 		rocc->intervals[rocc->intervals_head].pkts_acked += rs->acked_sacked;
