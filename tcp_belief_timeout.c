@@ -30,7 +30,7 @@ struct rocc_interval {
 	u32 pkts_acked;
 	u32 pkts_lost;
 	bool app_limited;
-	u32 rtt_us;
+	u32 min_rtt_us;
 
 	// metrics at interval creation time
 	u64 ic_rs_prior_mstamp;
@@ -143,7 +143,7 @@ static void update_beliefs(struct rocc_data *rocc) {
 	u16 et = rocc->intervals_head;  // end time
 	u64 et_tstamp = rocc->intervals[et].start_us;
 
-	u32 this_rtt_us;
+	u32 this_min_rtt_us;
 
 	u64 st_tstamp;
 	u32 cum_pkts_acked = 0;
@@ -167,16 +167,27 @@ static void update_beliefs(struct rocc_data *rocc) {
 	u32 time_since_last_timeout = tcp_stamp_us_delta(now, rocc->last_timeout_tstamp);
 	bool timeout = time_since_last_timeout > rocc_timeout_period * rocc->min_rtt_us;
 
+	// UPDATE QDEL BELIEFS
+	this_interval = &rocc->intervals[et & rocc_num_intervals_mask];
+	this_min_rtt_us = this_interval->min_rtt_us;
+	if(this_min_rtt_us > rtprop + max_jitter) {
+		beliefs->min_qdel = this_min_rtt_us - rtprop - max_jitter;
+	}
+	else {
+		beliefs->min_qdel = 0;
+	}
+
+	// UPDATE LINK RATE BELIEFS
 	// The et interval might have just started with very few measurements. So we
 	// ignore measurements in that interval... We can perhaps keep a tstamp of
 	// the last measurement in that interval?
 	for (st = 1; st < rocc_num_intervals; st++) {
 		this_interval = &rocc->intervals[(et + st) & rocc_num_intervals_mask];
-		this_rtt_us = this_interval->rtt_us;
+		this_min_rtt_us = this_interval->min_rtt_us;
 		st_tstamp = this_interval->start_us;
 		window = tcp_stamp_us_delta(et_tstamp, st_tstamp);
 
-		this_high_delay = this_rtt_us > rtprop + max_jitter;
+		this_high_delay = this_min_rtt_us > rtprop + max_jitter;
 		this_loss = get_loss_mode(this_interval->pkts_acked, this_interval->pkts_lost);
 		// TODO: loss was detected in this interval does not mean this interval
 		// was utilized. Things were utilized when pkt with sequence number just
@@ -188,15 +199,6 @@ static void update_beliefs(struct rocc_data *rocc) {
 			cum_utilized = cum_utilized && this_utilized;
 		}
 
-		// UPDATE QDEL BELIEFS
-		if(this_rtt_us > rtprop + max_jitter) {
-			beliefs->min_qdel = this_rtt_us - rtprop - max_jitter;
-		}
-		else {
-			beliefs->min_qdel = 0;
-		}
-
-		// UPDATE LINK RATE BELIEFS
 		cum_pkts_acked += this_interval->pkts_acked;
 		// cum_ack_rate =
 		// 	U64_S_TO_US * cum_pkts_acked / window;
@@ -305,7 +307,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		rocc->intervals[rocc->intervals_head].pkts_acked = rs->acked_sacked;
 		rocc->intervals[rocc->intervals_head].pkts_lost = rs->losses;
 		rocc->intervals[rocc->intervals_head].app_limited = rs->is_app_limited;
-		rocc->intervals[rocc->intervals_head].rtt_us = rs->rtt_us;
+		rocc->intervals[rocc->intervals_head].min_rtt_us = rs->rtt_us;
 		rocc->intervals[rocc->intervals_head].ic_rs_prior_mstamp = rs->prior_mstamp;
 		rocc->intervals[rocc->intervals_head].ic_rs_prior_delivered = rs->prior_delivered;
 		update_beliefs(rocc);
@@ -315,8 +317,8 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		rocc->intervals[rocc->intervals_head].pkts_lost += rs->losses;
 		rocc->intervals[rocc->intervals_head].app_limited |= rs->is_app_limited;
 		// TODO: check what kind of aggregation we want here.
-		rocc->intervals[rocc->intervals_head].rtt_us =
-			min_t(u32, (u32) rs->rtt_us, rocc->intervals[rocc->intervals_head].rtt_us);
+		rocc->intervals[rocc->intervals_head].min_rtt_us =
+			min_t(u32, (u32) rs->rtt_us, rocc->intervals[rocc->intervals_head].min_rtt_us);
 	}
 
 	// Find the statistics from the last `hist` seconds
