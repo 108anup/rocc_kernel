@@ -1,7 +1,7 @@
 ifneq ($(KERNELRELEASE),)
 
 # kbuild part of makefile
-obj-m  := tcp_slow_conv.o
+obj-m  := tcp_slow_paced.o
 
 else
 # normal makefile
