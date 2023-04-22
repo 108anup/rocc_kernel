@@ -6,16 +6,17 @@
 
 #define ROCC_DEBUG
 #define U64_S_TO_US ((u64) 1e6)
-#define INIT_MAX_C ((u32) 1e5)
-// ^^ This is roughly 1.20 Gbps.
+#define INIT_MAX_C ((u64) 1e5)
+// ^^ This is roughly 1.20 Gbps for 1448 MSS
+# define INIT_MIN_C ((u64) 1)
+// ^^ This is roughly 12 Kbps for 1448 MSS
 
 // Should be a power of two so rocc_num_intervals_mask can be set
 static const u16 rocc_num_intervals = 16;
 // rocc_num_intervals expressed as a mask. It is always equal to
 // rocc_num_intervals-1
 static const u16 rocc_num_intervals_mask = 15;
-static const u32 rocc_min_cwnd = 2;
-static const u32 rocc_alpha_segments = 5;
+static const u32 rocc_alpha_segments = 10;
 // Maximum tolerable loss rate, expressed as `loss_thresh / 1024`. Calculations
 // are faster if things are powers of 2
 static const u64 rocc_loss_thresh = 64;
@@ -76,8 +77,6 @@ struct rocc_data {
 	u64 last_update_tstamp;
 
 	u64 last_loss_tstamp;
-	u32 last_cwnd;
-	u32 last_to_last_cwnd;
 
 	struct belief_data *beliefs;
 
@@ -127,20 +126,18 @@ static void rocc_init(struct sock *sk)
 	rocc->loss_happened = false;
 
 	rocc->last_loss_tstamp = 0; // tcp_sk(sk)->tcp_mstamp;
-	rocc->last_cwnd = rocc_min_cwnd;
-	rocc->last_to_last_cwnd = rocc_min_cwnd;
 
 	rocc->beliefs = kzalloc(sizeof(*(rocc->beliefs)), GFP_KERNEL);
 	rocc->beliefs->max_c = INIT_MAX_C;
 	// Setting this as U32_MAX and then setting cwnd as U32_MAX causes issues
 	// with the kernel... Earlier set as U32_MAX, even though, max_c is u64,
 	// keeping it at u32_max so that we can multiply and divide by microseconds.
-	rocc->beliefs->min_c = 0;
+	rocc->beliefs->min_c = INIT_MIN_C;
 	rocc->beliefs->min_qdel = 0;
-	rocc->beliefs->min_c_lambda = 0;
+	rocc->beliefs->min_c_lambda = INIT_MIN_C;
 
 	rocc->last_timeout_tstamp = 0;
-	rocc->last_timeout_minc = 0;
+	rocc->last_timeout_minc = INIT_MIN_C;
 	rocc->last_timeout_maxc = INIT_MAX_C;
 
 	rocc->state = SLOW_START;
@@ -193,7 +190,7 @@ static void update_beliefs(struct sock *sk) {
 	u32 rtprop = rocc->min_rtt_us;
 	u32 max_jitter = rtprop;
 
-	u64 new_min_c = 0;
+	u64 new_min_c = INIT_MIN_C;
 	u64 new_max_c = INIT_MAX_C;
 	u64 rocc_alpha_rate = (rocc_alpha_segments * rocc_get_mss(tsk) * U64_S_TO_US) / rocc->min_rtt_us;
 	u64 max_c_lower_clamp = max_t(u64, 2, rocc_alpha_rate);
@@ -312,7 +309,7 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 
 	u32 rtprop = rocc->min_rtt_us;
 	u32 max_jitter = rtprop;
-	u64 new_min_c_lambda = 0;
+	u64 new_min_c_lambda = INIT_MIN_C;
 
 	this_interval = &rocc->intervals[et & rocc_num_intervals_mask];
 	this_max_rtt_us = this_interval->max_rtt_us;
@@ -530,8 +527,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		}
 
 		else if(rocc->state == DRAIN) {
-			if(latest_inflight_segments > 10 * rocc_alpha_segments) {
-				// ^^ we are okay losing 10 alpha segments every probe
+			if(latest_inflight_segments > rocc_alpha_segments) {
 				sk->sk_pacing_rate = rocc_alpha_rate;
 			} else {
 				rocc->state = PROBE;
