@@ -25,7 +25,7 @@ static const u32 rocc_history_periods = 8;
 static const u32 rocc_timeout_period = 12;
 static const u32 rocc_significant_mult_percent = 110;
 
-static const u32 rocc_measurement_interval = 8;
+static const u32 rocc_measurement_interval = 2;
 
 enum rocc_state {
 	SLOW_START,
@@ -604,7 +604,7 @@ static void rocc_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 
 static struct tcp_congestion_ops tcp_rocc_cong_ops __read_mostly = {
 	.flags = TCP_CONG_NON_RESTRICTED,
-	.name = "slow_paced",
+	.name = "slow_paced2",
 	.owner = THIS_MODULE,
 	.init = rocc_init,
 	.release	= rocc_release,
