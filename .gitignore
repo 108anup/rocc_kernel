@@ -8,3 +8,4 @@ modules.order
 *.o
 *.o.d
 .cache.mk
+built-in.a
