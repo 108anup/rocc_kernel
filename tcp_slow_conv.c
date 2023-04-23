@@ -16,7 +16,7 @@ static const u16 rocc_num_intervals = 16;
 // rocc_num_intervals expressed as a mask. It is always equal to
 // rocc_num_intervals-1
 static const u16 rocc_num_intervals_mask = 15;
-static const u32 rocc_alpha_segments = 10;
+static const u32 rocc_alpha_segments = 5;
 // Maximum tolerable loss rate, expressed as `loss_thresh / 1024`. Calculations
 // are faster if things are powers of 2
 static const u64 rocc_loss_thresh = 64;
@@ -414,6 +414,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	// Number of packets acked and lost in the last `hist_us`
 	u32 pkts_acked, pkts_lost;
 	bool loss_mode, app_limited;
+	bool beliefs_updated = false;
 
 	u64 rocc_alpha_rate;
 	u32 latest_inflight_segments = rs->prior_in_flight; // upper bound on bottleneck queue size.
@@ -468,8 +469,8 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		update_beliefs(sk);
 		update_beliefs_send(sk, rs);
 		print_beliefs(sk);
-	}
-	else {
+		beliefs_updated = true;
+	} else {
 		rocc->intervals[rocc->intervals_head].pkts_acked += rs->acked_sacked;
 		rocc->intervals[rocc->intervals_head].pkts_lost += rs->losses;
 		rocc->intervals[rocc->intervals_head].app_limited |= rs->is_app_limited;
@@ -498,6 +499,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	rocc_alpha_rate = (rocc_alpha_segments * rocc_get_mss(tsk) * U64_S_TO_US) / rocc->min_rtt_us;
 	if(loss_mode) rocc->state = CONG_AVOID;
 
+	// if (beliefs_updates) {
 	if (tcp_stamp_us_delta(timestamp, rocc->last_update_tstamp) >= rocc->min_rtt_us) {
 		rocc->last_update_tstamp = timestamp;
 
@@ -522,7 +524,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 			else:
 				+ 3min_c_lambda + 1alpha
 			*/
-			if(latest_inflight_segments > rocc_alpha_segments) {
+			if(latest_inflight_segments > 2 * rocc_alpha_segments) {
 				sk->sk_pacing_rate = rocc_alpha_rate;
 			}
 			else {
