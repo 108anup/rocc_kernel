@@ -168,7 +168,7 @@ static void update_beliefs(struct sock *sk) {
 
 	u16 st;
 	u16 et = rocc->intervals_head;  // end time
-	u64 et_tstamp = rocc->intervals[et].start_us;
+	u64 et_tstamp = rocc->intervals[et & rocc_num_intervals_mask].start_us;
 
 	u32 this_min_rtt_us;
 
@@ -289,7 +289,7 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 	u16 st;
 	u64 st_tstamp;
 	u16 et = rocc->intervals_head;  // end time
-	// u64 et_tstamp = rocc->intervals[et].start_us;
+	u64 et_tstamp = rocc->intervals[et & rocc_num_intervals_mask].start_us;
 
 	struct rocc_interval *this_interval;
 	struct rocc_interval *next_future_interval;
@@ -315,6 +315,12 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 	this_under_utilized = !this_loss && !this_high_delay;
 	cum_under_utilized = cum_under_utilized && this_under_utilized;
 
+	// This is synchronized with the update_beliefs function.
+	// Do better software engineering here.
+	u64 now = et_tstamp;
+	u32 time_since_last_timeout = tcp_stamp_us_delta(now, rocc->last_timeout_tstamp);
+	bool timeout = time_since_last_timeout > rocc_timeout_period * rocc->min_rtt_us;
+
 	// printk(KERN_INFO "update beliefs send begin min_c_lambda %llu", beliefs->min_c_lambda);
 
 	for (st = 1; st < rocc_num_intervals; st++) {
@@ -335,9 +341,10 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 		// now.
 		if (next_future_interval->ic_bytes_sent > now_bytes_delivered) continue;
 
-		// Stop if we have already considered this and past intervals.
-		if (this_interval->processed) break;
-		this_interval->processed = true;
+		// Since we want to recompute min_c_lambda, we need to re-process the intervals.
+		// // Stop if we have already considered this and past intervals.
+		// if (this_interval->processed) break;
+		// this_interval->processed = true;
 
 		// If we saw any utilization signals then we stop updating min_c_lambda
 		if (!cum_under_utilized) break;
@@ -350,7 +357,11 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 		new_min_c_lambda = max_t(u64, new_min_c_lambda, this_min_c_lambda);
 	}
 
-	beliefs->min_c_lambda = max_t(u64, beliefs->min_c_lambda, new_min_c_lambda);
+	if(timeout) {
+		beliefs->min_c_lambda = max_t(u64, 2 * beliefs->min_c_lambda / 3, new_min_c_lambda);
+	} else {
+		beliefs->min_c_lambda = max_t(u64, beliefs->min_c_lambda, new_min_c_lambda);
+	}
 }
 
 void print_beliefs(struct sock *sk){
@@ -466,8 +477,8 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		rocc->intervals[rocc->intervals_head].ic_rs_prior_delivered = rs->prior_delivered;
 		rocc->intervals[rocc->intervals_head].processed = false;
 		rocc->intervals[rocc->intervals_head].invalid = false;
-		update_beliefs(sk);
 		update_beliefs_send(sk, rs);
+		update_beliefs(sk);
 		print_beliefs(sk);
 		beliefs_updated = true;
 	} else {
