@@ -25,7 +25,7 @@ static const u32 rocc_history_periods = 8;
 static const u32 rocc_timeout_period = 12;
 static const u32 rocc_significant_mult_percent = 110;
 
-static const u32 rocc_measurement_interval = 2;
+static const u32 rocc_measurement_interval = 3;
 
 enum rocc_state {
 	SLOW_START,
