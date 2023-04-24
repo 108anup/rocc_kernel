@@ -46,6 +46,7 @@ struct rocc_interval {
 	u64 ic_rs_prior_mstamp;
 	u32 ic_rs_prior_delivered;
 	u64 ic_bytes_sent;
+	u64 ic_delivered;
 
 	bool processed;
 	bool invalid;
@@ -105,6 +106,7 @@ static void rocc_init(struct sock *sk)
 		rocc->intervals[i].ic_rs_prior_mstamp = 0;
 		rocc->intervals[i].ic_rs_prior_delivered = 0;
 		rocc->intervals[i].ic_bytes_sent = 0;
+		rocc->intervals[i].ic_delivered = 0;
 
 		rocc->intervals[i].processed = false;
 		rocc->intervals[i].invalid = true;
@@ -134,6 +136,7 @@ static void rocc_init(struct sock *sk)
 	rocc->beliefs->min_c = INIT_MIN_C;
 	rocc->beliefs->min_qdel = 0;
 	rocc->beliefs->min_c_lambda = INIT_MIN_C;
+	rocc->beliefs->last_min_c_lambda = INIT_MIN_C;
 
 	rocc->last_timeout_tstamp = 0;
 	rocc->last_timeout_minc = INIT_MIN_C;
@@ -297,7 +300,7 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 	u64 this_max_rtt_us;
 	bool this_loss;
 	bool this_high_delay;
-	u64 now_bytes_delivered = ((u64) rocc_get_mss(tsk)) * tsk->delivered;
+	u64 delivered_1rtt_ago;
 	u64 this_bytes_sent;
 	u64 this_min_c_lambda;
 	u64 this_interval_length;
@@ -307,9 +310,10 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 
 	u32 rtprop = rocc->min_rtt_us;
 	u32 max_jitter = rtprop;
-	u64 new_min_c_lambda = 0;
+	u64 new_min_c_lambda = INIT_MIN_C;
 
 	this_interval = &rocc->intervals[et & rocc_num_intervals_mask];
+	delivered_1rtt_ago = this_interval->ic_rs_prior_delivered;
 	this_max_rtt_us = this_interval->max_rtt_us;
 	this_high_delay = this_max_rtt_us > rtprop + max_jitter;
 	this_loss = get_loss_mode(this_interval->pkts_acked, this_interval->pkts_lost);
@@ -340,12 +344,12 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 
 		// We only consider this interval if all packets sent were 1 RTT before
 		// now.
-		if (next_future_interval->ic_bytes_sent > now_bytes_delivered) continue;
+		if (next_future_interval->ic_delivered > delivered_1rtt_ago) continue;
 
 		// Since we want to recompute min_c_lambda, we need to re-process the intervals.
 		// // Stop if we have already considered this and past intervals.
 		// if (this_interval->processed) break;
-		// this_interval->processed = true;
+		this_interval->processed = true;
 
 		// If we saw any utilization signals then we stop updating min_c_lambda
 		if (!cum_under_utilized) break;
@@ -489,6 +493,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		rocc->intervals[rocc->intervals_head].ic_bytes_sent = tsk->bytes_sent;
 		rocc->intervals[rocc->intervals_head].ic_rs_prior_mstamp = rs->prior_mstamp;
 		rocc->intervals[rocc->intervals_head].ic_rs_prior_delivered = rs->prior_delivered;
+		rocc->intervals[rocc->intervals_head].ic_delivered = tsk->delivered;
 		rocc->intervals[rocc->intervals_head].processed = false;
 		rocc->intervals[rocc->intervals_head].invalid = false;
 		update_beliefs_send(sk, rs);
