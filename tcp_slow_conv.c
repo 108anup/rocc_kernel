@@ -56,6 +56,7 @@ struct belief_data {
 	u64 max_c;  // segments or packets per second
 	u32 min_qdel;  // in microseconds
 	u64 min_c_lambda;  // segments or packets per second
+	u64 last_min_c_lambda;  // segments or packets per second
 };
 
 static u32 id = 0;
@@ -357,11 +358,24 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 		new_min_c_lambda = max_t(u64, new_min_c_lambda, this_min_c_lambda);
 	}
 
-	if(timeout) {
-		beliefs->min_c_lambda = max_t(u64, 2 * beliefs->min_c_lambda / 3, new_min_c_lambda);
+	if(new_min_c_lambda > beliefs->min_c_lambda) {
+		beliefs->min_c_lambda = new_min_c_lambda;
+		beliefs->last_min_c_lambda = beliefs->min_c_lambda;
+	} else if (timeout) {
+		if(beliefs->min_c_lambda > beliefs->last_min_c_lambda) {
+			beliefs->min_c_lambda = beliefs->last_min_c_lambda;
+		} else {
+			beliefs->min_c_lambda = (2 * beliefs->min_c_lambda) / 3;
+		}
 	} else {
-		beliefs->min_c_lambda = max_t(u64, beliefs->min_c_lambda, new_min_c_lambda);
+		// Don't change min_c_lambda.
 	}
+
+	// if(timeout) {
+	// 	beliefs->min_c_lambda = max_t(u64, 2 * beliefs->min_c_lambda / 3, new_min_c_lambda);
+	// } else {
+	// 	beliefs->min_c_lambda = max_t(u64, beliefs->min_c_lambda, new_min_c_lambda);
+	// }
 }
 
 void print_beliefs(struct sock *sk){
