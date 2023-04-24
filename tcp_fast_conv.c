@@ -249,6 +249,9 @@ static void update_beliefs(struct sock *sk) {
 	}
 
 	if(timeout) {
+		u64 overall_min_c = max_t(u64, rocc->beliefs->min_c, new_min_c);
+		u64 overall_max_c = min_t(u64, rocc->beliefs->max_c, new_max_c);
+		bool beliefs_far = overall_max_c > 2 * overall_min_c;
 		bool minc_changed = new_min_c > rocc->last_timeout_minc;
 		bool maxc_changed = new_max_c < rocc->last_timeout_maxc;
 		bool minc_changed_significantly = new_min_c > (rocc_significant_mult_percent * rocc->last_timeout_minc) / 100;
@@ -256,8 +259,8 @@ static void update_beliefs(struct sock *sk) {
 		bool beliefs_invalid = new_max_c < new_min_c;
 		bool minc_came_close = minc_changed && beliefs_invalid;
 		bool maxc_came_close = maxc_changed && beliefs_invalid;
-		bool timeout_minc = !minc_changed && (maxc_came_close || !maxc_changed_significantly);
-		bool timeout_maxc = !maxc_changed && (minc_came_close || !minc_changed_significantly);
+		bool timeout_minc = !minc_changed && (maxc_came_close || !maxc_changed_significantly) && !beliefs_far;
+		bool timeout_maxc = !maxc_changed && (minc_came_close || !minc_changed_significantly) && !beliefs_far;
 
 		if(timeout_minc) {
 			beliefs->min_c = new_min_c;
@@ -508,56 +511,22 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	if (tcp_stamp_us_delta(timestamp, rocc->last_update_tstamp) >= rocc->min_rtt_us) {
 		rocc->last_update_tstamp = timestamp;
 
-		// We are stretching the drain period to rocc_measurement_interval long.
-		/**
-		 * The 3 is basically R + D + quantization error.
-		 * In the kernel the error is 0. Thus use 2 instead of 3.
-		r_f = max alpha,
-		if (+ 1bq_belief + -1alpha > 0):
-			+ 1alpha
-		else:
-			+ 3min_c_lambda + 1alpha
+		/*
+		"""
+            r_f = max alpha,
+            if (+ 1min_qdel > 0):
+                + 0.5min_c
+            else:
+                + 2min_c
+		"""
 		*/
 
-		if(rocc->state == SLOW_START) {
-			if(beliefs->min_qdel > 0) {
-				sk->sk_pacing_rate = (beliefs->min_c * rocc_get_mss(tsk)) / 2;
-			}
-			else {
-				sk->sk_pacing_rate = 2 * beliefs->min_c * rocc_get_mss(tsk);
-			}
+		if(beliefs->min_qdel > 0) {
+			sk->sk_pacing_rate = (beliefs->min_c * rocc_get_mss(tsk)) / 2;
 		}
-
-		else if(rocc->state == DRAIN) {
-			if(latest_inflight_segments > 2 * rocc_alpha_segments) {
-				sk->sk_pacing_rate = rocc_alpha_rate;
-			} else {
-				rocc->state = PROBE;
-				rocc->state_probe_count = 1;
-				sk->sk_pacing_rate =
-					((1 + rocc_measurement_interval) * beliefs->min_c_lambda *
-					 rocc_get_mss(tsk)) /
-						rocc_measurement_interval +
-					rocc_alpha_rate;
-			}
-		}
-
 		else {
-			if(rocc->state != PROBE) {
-				printk(KERN_ERR "Invalid state for rocc: %d", rocc->state);
-			}
-			rocc->state_probe_count++;
-			sk->sk_pacing_rate =
-				((1 + rocc_measurement_interval) * beliefs->min_c_lambda *
-					rocc_get_mss(tsk)) /
-					rocc_measurement_interval +
-				rocc_alpha_rate;
-			if(rocc->state_probe_count == rocc_measurement_interval) {
-				rocc->state = DRAIN;
-				rocc->state_probe_count = 0;
-			}
+			sk->sk_pacing_rate = 2 * beliefs->min_c * rocc_get_mss(tsk);
 		}
-
 		// jitter + rtprop = 2 * rocc->min_rtt_us
 		tsk->snd_cwnd = (2 * beliefs->max_c * (2 * rocc->min_rtt_us)) / U64_S_TO_US;
 
@@ -604,7 +573,7 @@ static void rocc_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 
 static struct tcp_congestion_ops tcp_rocc_cong_ops __read_mostly = {
 	.flags = TCP_CONG_NON_RESTRICTED,
-	.name = "slow_paced",
+	.name = "fast_conv",
 	.owner = THIS_MODULE,
 	.init = rocc_init,
 	.release	= rocc_release,
