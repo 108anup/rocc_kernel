@@ -58,6 +58,7 @@ struct belief_data {
 	u64 max_c;  // segments or packets per second
 	u32 min_qdel;  // in microseconds
 	u64 min_c_lambda;  // segments or packets per second
+	u64 last_min_c_lambda;  // segments or packets per second
 };
 
 static u32 id = 0;
