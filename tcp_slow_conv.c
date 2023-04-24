@@ -362,14 +362,25 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 		new_min_c_lambda = max_t(u64, new_min_c_lambda, this_min_c_lambda);
 	}
 
+	// printk(
+	// 	KERN_INFO
+	// 	"rocc update_beliefs_send end min_c_lambda %llu "
+	// 	"new_min_c_lambda %llu last_min_c_lambda %llu",
+	// 	beliefs->min_c_lambda, new_min_c_lambda,
+	// 	beliefs->last_min_c_lambda);
+
 	if(new_min_c_lambda > beliefs->min_c_lambda) {
-		beliefs->min_c_lambda = new_min_c_lambda;
 		beliefs->last_min_c_lambda = beliefs->min_c_lambda;
+		beliefs->min_c_lambda = new_min_c_lambda;
 	} else if (timeout) {
+		// even if new_min_c_lambda is greater than last_min_c_lambda, we don't
+		// update last_min_c_lambda. last_min_c_lambda tracks the last probe
+		// that does not cause high utilization. new_min_c_lambda may not have
+		// this property.
 		if(beliefs->min_c_lambda > beliefs->last_min_c_lambda) {
-			beliefs->min_c_lambda = beliefs->last_min_c_lambda;
+			beliefs->min_c_lambda = max_t(u64, beliefs->last_min_c_lambda, new_min_c_lambda);
 		} else {
-			beliefs->min_c_lambda = (2 * beliefs->min_c_lambda) / 3;
+			beliefs->min_c_lambda = max_t(u64, (2 * beliefs->min_c_lambda) / 3, new_min_c_lambda);
 		}
 	} else {
 		// Don't change min_c_lambda.
