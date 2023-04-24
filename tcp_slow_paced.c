@@ -171,7 +171,7 @@ static void update_beliefs(struct sock *sk) {
 
 	u16 st;
 	u16 et = rocc->intervals_head;  // end time
-	u64 et_tstamp = rocc->intervals[et].start_us;
+	u64 et_tstamp = rocc->intervals[et & rocc_num_intervals_mask].start_us;
 
 	u32 this_min_rtt_us;
 
@@ -292,7 +292,7 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 	u16 st;
 	// u64 st_tstamp;
 	u16 et = rocc->intervals_head;  // end time
-	// u64 et_tstamp = rocc->intervals[et].start_us;
+	u64 et_tstamp = rocc->intervals[et & rocc_num_intervals_mask].start_us;
 
 	struct rocc_interval *this_interval;
 	struct rocc_interval *next_future_interval;
@@ -317,6 +317,12 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 	this_loss = get_loss_mode(this_interval->pkts_acked, this_interval->pkts_lost);
 	this_under_utilized = !this_loss && !this_high_delay;
 	cum_under_utilized = cum_under_utilized && this_under_utilized;
+
+	// This is synchronized with the update_beliefs function.
+	// Do better software engineering here.
+	u64 now = et_tstamp;
+	u32 time_since_last_timeout = tcp_stamp_us_delta(now, rocc->last_timeout_tstamp);
+	bool timeout = time_since_last_timeout > rocc_timeout_period * rocc->min_rtt_us;
 
 	// printk(KERN_INFO "update beliefs send begin min_c_lambda %llu", beliefs->min_c_lambda);
 
@@ -355,6 +361,12 @@ static void update_beliefs_send(struct sock *sk, const struct rate_sample *rs)
 		new_min_c_lambda = max_t(u64, new_min_c_lambda, this_min_c_lambda);
 	}
 
+	// TODO: Should timeout after 10 * MI not 10 * Rm.
+	// if(timeout) {
+	// 	beliefs->min_c_lambda = max_t(u64, 2 * beliefs->min_c_lambda / 3, new_min_c_lambda);
+	// } else {
+	// 	beliefs->min_c_lambda = max_t(u64, beliefs->min_c_lambda, new_min_c_lambda);
+	// }
 	beliefs->min_c_lambda = max_t(u64, beliefs->min_c_lambda, new_min_c_lambda);
 }
 
@@ -471,8 +483,8 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		rocc->intervals[rocc->intervals_head].ic_rs_prior_delivered = rs->prior_delivered;
 		rocc->intervals[rocc->intervals_head].processed = false;
 		rocc->intervals[rocc->intervals_head].invalid = false;
-		update_beliefs(sk);
 		update_beliefs_send(sk, rs);
+		update_beliefs(sk);
 		print_beliefs(sk);
 		beliefs_updated = true;
 	} else {
