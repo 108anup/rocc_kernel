@@ -500,7 +500,11 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	// sufficient history. We end up storing more history than needed, but
 	// that's ok
 	interval_length = 2 * hist_us / rocc_num_intervals + 1; // round up
-	if (rocc->intervals[rocc->intervals_head].start_us + interval_length < timestamp) {
+
+	BUILD_BUG_ON(rocc_history_periods * 2 != rocc_num_intervals);
+	// Sync the history and rate/cwnd updates.
+	// if (rocc->intervals[rocc->intervals_head].start_us + interval_length < timestamp) {
+	if (tcp_stamp_us_delta(timestamp, rocc->last_update_tstamp) >= rocc->min_rtt_us) {
 		// Push the buffer
 		rocc->intervals_head = (rocc->intervals_head - 1) & rocc_num_intervals_mask;
 		rocc->intervals[rocc->intervals_head].start_us = timestamp;
@@ -563,6 +567,9 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 			+ 3min_c_lambda + 1alpha
 		*/
 
+		// jitter + rtprop = 2 * rocc->min_rtt_us
+		tsk->snd_cwnd = (2 * beliefs->max_c * (2 * rocc->min_rtt_us)) / U64_S_TO_US;
+
 		if(rocc->state == SLOW_START) {
 			if(beliefs->min_qdel > 0) {
 				sk->sk_pacing_rate = (beliefs->min_c * rocc_get_mss(tsk)) / 2;
@@ -574,7 +581,19 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 
 		else if(rocc->state == DRAIN) {
 			if(latest_inflight_segments > 2 * rocc_alpha_segments) {
-				sk->sk_pacing_rate = rocc_alpha_rate;
+				// sk->sk_pacing_rate = rocc_alpha_rate;
+
+				// Do not decrease rate significantly. The kernel computes time
+				// to send next packet based on pacing rate and uses that to
+				// implement pacing. As a result, a very low rate results in
+				// time for next packet to become very large, and even after we
+				// increase the rate later, that increased rate only starts
+				// applying after the large time to next packet time has
+				// elapsed. This was very weird issue... As a hack we just
+				// reduce cwnd to drain. This actually might help drain quicker
+				// also :P
+
+				tsk->snd_cwnd = rocc_alpha_segments;
 			} else {
 				rocc->state = PROBE;
 				rocc->state_probe_count = 1;
@@ -601,9 +620,6 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 				rocc->state_probe_count = 0;
 			}
 		}
-
-		// jitter + rtprop = 2 * rocc->min_rtt_us
-		tsk->snd_cwnd = (2 * beliefs->max_c * (2 * rocc->min_rtt_us)) / U64_S_TO_US;
 
 		// lower bound clamps
 		tsk->snd_cwnd = max_t(u32, tsk->snd_cwnd, rocc_alpha_segments);
