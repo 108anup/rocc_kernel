@@ -47,6 +47,7 @@ struct rocc_interval {
 	u32 ic_rs_prior_delivered;
 	u64 ic_bytes_sent;
 	u64 ic_delivered;
+	u64 ic_sending_rate;  // segments per second
 
 	bool processed;
 	bool invalid;
@@ -58,6 +59,7 @@ struct belief_data {
 	u32 min_qdel;  // in microseconds
 	u64 min_c_lambda;  // segments or packets per second
 	u64 last_min_c_lambda;  // segments or packets per second
+	bool odd_even;
 };
 
 static u32 id = 0;
@@ -76,8 +78,11 @@ struct rocc_data {
 	bool loss_happened;
 
 	u64 last_update_tstamp;
+	u64 last_segs_sent;
+	u64 last_segs_delivered;
+	u64 estimated_cumulative_segs_sent;
 
-	u64 last_loss_tstamp;
+	// u64 last_loss_tstamp;
 
 	struct belief_data *beliefs;
 
@@ -124,9 +129,12 @@ static void rocc_init(struct sock *sk)
 	// Setting last time as 0 in the beginning should allow running cwnd update
 	// the first time as long as min_rtt_us < timestamp.
 	rocc->last_update_tstamp = 0; // tcp_sk(sk)->tcp_mstamp;
+	rocc->last_segs_sent = 0;
+	rocc->last_segs_delivered = 0;
+	rocc->estimated_cumulative_segs_sent = 0;
 	rocc->loss_happened = false;
 
-	rocc->last_loss_tstamp = 0; // tcp_sk(sk)->tcp_mstamp;
+	// rocc->last_loss_tstamp = 0; // tcp_sk(sk)->tcp_mstamp;
 
 	rocc->beliefs = kzalloc(sizeof(*(rocc->beliefs)), GFP_KERNEL);
 	rocc->beliefs->max_c = INIT_MAX_C;
@@ -137,6 +145,7 @@ static void rocc_init(struct sock *sk)
 	rocc->beliefs->min_qdel = 0;
 	rocc->beliefs->min_c_lambda = INIT_MIN_C;
 	rocc->beliefs->last_min_c_lambda = INIT_MIN_C;
+	rocc->beliefs->odd_even = false;
 
 	rocc->last_timeout_tstamp = 0;
 	rocc->last_timeout_minc = INIT_MIN_C;
@@ -403,6 +412,8 @@ void print_beliefs(struct sock *sk){
 	u32 ic_rs_window = 0;
 	s32 delivered_delta = 0;
 	s32 sent_delta_pkts = 0;
+	u32 estimated_sent = 0;
+	u64 sending_rate = 0;
 
 	printk(KERN_INFO "rocc min_c %llu max_c %llu min_qdel %u min_c_lambda %llu",
 		   beliefs->min_c, beliefs->max_c, beliefs->min_qdel,
@@ -410,7 +421,7 @@ void print_beliefs(struct sock *sk){
 	for (i = 0; i < rocc_num_intervals; ++i) {
 		id = (rocc->intervals_head + i) & rocc_num_intervals_mask;
 		nid = (id - 1) & rocc_num_intervals_mask;  // next id
-		if (i >= 1) {
+		if (i >= 1 && !rocc->intervals[id].invalid) {
 			window = tcp_stamp_us_delta(rocc->intervals[nid].start_us,
 										rocc->intervals[id].start_us);
 			ic_rs_window =
@@ -421,23 +432,27 @@ void print_beliefs(struct sock *sk){
 			sent_delta_pkts = (((s64)rocc->intervals[nid].ic_bytes_sent) -
 							   rocc->intervals[id].ic_bytes_sent) /
 							  rocc_get_mss(tsk);
+			estimated_sent = (rocc->intervals[nid].ic_sending_rate * window / U64_S_TO_US);
+			sending_rate = rocc->intervals[nid].ic_sending_rate;
 		}
 		printk(KERN_INFO
 			   "rocc intervals start_us %llu window %u acked %u lost %u "
-			   "ic_rs_prior_mstamp %llu ic_rs_prior_delivered %u "
+			   // "ic_rs_prior_mstamp %llu ic_rs_prior_delivered %u "
 			   "ic_rs_window %u delivered_delta %d "
 			   "app_limited %d min_rtt_us %u max_rtt_us %u "
 			   "i %u id %u invalid %d processed %d "
-			   "ic_bytes_sent %llu sent_delta_pkts %d",
+			   "ic_bytes_sent %llu sent_delta_pkts %d estimated_sent %u "
+			   "sending_rate %llu",
 			   rocc->intervals[id].start_us, window,
 			   rocc->intervals[id].pkts_acked, rocc->intervals[id].pkts_lost,
-			   rocc->intervals[id].ic_rs_prior_mstamp,
-			   rocc->intervals[id].ic_rs_prior_delivered, ic_rs_window,
+			   // rocc->intervals[id].ic_rs_prior_mstamp,
+			   // rocc->intervals[id].ic_rs_prior_delivered,
+			   ic_rs_window,
 			   delivered_delta, (int)rocc->intervals[id].app_limited,
 			   rocc->intervals[id].min_rtt_us, rocc->intervals[id].max_rtt_us,
 			   i, id, rocc->intervals[id].invalid,
 			   rocc->intervals[id].processed, rocc->intervals[id].ic_bytes_sent,
-			   sent_delta_pkts);
+			   sent_delta_pkts, estimated_sent, sending_rate);
 	}
 }
 
@@ -492,7 +507,11 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	// sufficient history. We end up storing more history than needed, but
 	// that's ok
 	interval_length = 2 * hist_us / rocc_num_intervals + 1; // round up
-	if (rocc->intervals[rocc->intervals_head].start_us + interval_length < timestamp) {
+
+	BUILD_BUG_ON(rocc_history_periods * 2 != rocc_num_intervals);
+	// Sync the history and rate/cwnd updates.
+	// if (rocc->intervals[rocc->intervals_head].start_us + interval_length < timestamp) {
+	if (tcp_stamp_us_delta(timestamp, rocc->last_update_tstamp) >= rocc->min_rtt_us) {
 		// Push the buffer
 		rocc->intervals_head = (rocc->intervals_head - 1) & rocc_num_intervals_mask;
 		rocc->intervals[rocc->intervals_head].start_us = timestamp;
@@ -507,6 +526,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		rocc->intervals[rocc->intervals_head].ic_delivered = tsk->delivered;
 		rocc->intervals[rocc->intervals_head].processed = false;
 		rocc->intervals[rocc->intervals_head].invalid = false;
+		rocc->intervals[rocc->intervals_head].ic_sending_rate = sk->sk_pacing_rate / rocc_get_mss(tsk);
 		update_beliefs_send(sk, rs);
 		update_beliefs(sk);
 		print_beliefs(sk);
@@ -540,9 +560,39 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	rocc_alpha_rate = (rocc_alpha_segments * rocc_get_mss(tsk) * U64_S_TO_US) / rocc->min_rtt_us;
 	if(loss_mode) rocc->state = CONG_AVOID;
 
-	// if (beliefs_updates) {
+	// if (beliefs_updated) {
 	if (tcp_stamp_us_delta(timestamp, rocc->last_update_tstamp) >= rocc->min_rtt_us) {
+
+		if(rocc->last_update_tstamp > 0) {
+
+			u32 elapsed_since_last_update =
+				tcp_stamp_us_delta(timestamp, rocc->last_update_tstamp);
+
+			u64 this_estimated_segs_sent = (sk->sk_pacing_rate * elapsed_since_last_update / U64_S_TO_US) / rocc_get_mss(tsk);
+			u64 tsk_sent = tsk->bytes_sent / rocc_get_mss(tsk);
+			u64 tsk_delivered = tsk->delivered;
+			u64 this_tsk_sent = tsk_sent - rocc->last_segs_sent;
+			u64 this_tsk_delivered = tsk_delivered - rocc->last_segs_delivered;
+			rocc->last_segs_sent = tsk_sent;
+			rocc->last_segs_delivered = tsk_delivered;
+			rocc->estimated_cumulative_segs_sent += this_estimated_segs_sent;
+
+			printk(KERN_INFO
+				   "rocc debug_sent elapsed_since_last_update %u "
+				   "this_estimated_segs_sent %llu this_tsk_sent %llu "
+				   "this_tsk_delivered %llu "
+				   "estimated_cumulative_segs_sent %llu tsk_sent %llu "
+				   "tsk_delivered %llu last_interval_sending_rate %llu",
+				   elapsed_since_last_update,
+				   this_estimated_segs_sent, this_tsk_sent, this_tsk_delivered,
+				   rocc->estimated_cumulative_segs_sent, tsk_sent,
+				   tsk_delivered, ((u64) sk->sk_pacing_rate) / rocc_get_mss(tsk));
+		}
+
 		rocc->last_update_tstamp = timestamp;
+
+		// jitter + rtprop = 2 * rocc->min_rtt_us
+		tsk->snd_cwnd = (2 * beliefs->max_c * (2 * (u64) rocc->min_rtt_us)) / U64_S_TO_US;
 
 		if(rocc->state == SLOW_START) {
 			if(beliefs->min_qdel > 0) {
@@ -566,19 +616,36 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 				+ 3min_c_lambda + 1alpha
 			*/
 			if(latest_inflight_segments > 2 * rocc_alpha_segments) {
-				sk->sk_pacing_rate = rocc_alpha_rate;
+				// sk->sk_pacing_rate = rocc_alpha_rate;
+
+				// Do not decrease rate significantly. The kernel computes time
+				// to send next packet based on pacing rate and uses that to
+				// implement pacing. As a result, a very low rate results in
+				// time for next packet to become very large, and even after we
+				// increase the rate later, that increased rate only starts
+				// applying after the large time to next packet time has
+				// elapsed. This was very weird issue... As a hack we just
+				// reduce cwnd to drain. This actually might help drain quicker
+				// also :P
+
+				tsk->snd_cwnd = rocc_alpha_segments;
 			}
 			else {
 				sk->sk_pacing_rate = 2 * beliefs->min_c_lambda * rocc_get_mss(tsk) + rocc_alpha_rate;
 			}
 		}
 
-		// jitter + rtprop = 2 * rocc->min_rtt_us
-		tsk->snd_cwnd = (2 * beliefs->max_c * (2 * rocc->min_rtt_us)) / U64_S_TO_US;
-
 		// lower bound clamps
 		tsk->snd_cwnd = max_t(u32, tsk->snd_cwnd, rocc_alpha_segments);
 		sk->sk_pacing_rate = max_t(u64, sk->sk_pacing_rate, rocc_alpha_rate);
+
+		// if(rocc->beliefs->odd_even) {
+		// 	sk->sk_pacing_rate = (u64) 4000 * rocc_get_mss(tsk);
+		// } else {
+		// 	// sk->sk_pacing_rate = (u64) 60 * rocc_get_mss(tsk);
+		// 	tsk->snd_cwnd = rocc_alpha_segments;
+		// }
+		// rocc->beliefs->odd_even = !rocc->beliefs->odd_even;
 
 #ifdef ROCC_DEBUG
 		printk(KERN_INFO
