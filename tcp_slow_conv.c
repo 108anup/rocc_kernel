@@ -270,6 +270,7 @@ static void update_beliefs(struct sock *sk) {
 		bool timeout_maxc = !maxc_changed && (minc_came_close || !minc_changed_significantly);
 
 		if(timeout_minc) {
+			// TODO: this should be replaced by recomputed minc since last timeout.
 			beliefs->min_c = new_min_c;
 		} else {
 			beliefs->min_c = max_t(u64, beliefs->min_c, new_min_c);
